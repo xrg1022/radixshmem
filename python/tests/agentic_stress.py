@@ -18,12 +18,18 @@ generate the new blocks' bytes -> think -> allocate, write, insert. Block
 bytes are a function of the block hash h: FULL [h, h+1, ...], SWA [~h, ~h+1,
 ...], Mamba [h, h-1, ...] as uint64 words, so a reader can check what it got.
 --index-only keeps the old index-only flow: query -> think -> insert.
+--push adds push_async(rank=None) after every insert, to the peer the RHT
+picks (--push-evict migrates instead of copying); --worker-hosts together
+with --remote-cmd starts ranks on other hosts.
 
     python tests/agentic_stress.py                      # defaults: 8 nodes, 128 sessions, 60 s
     python tests/agentic_stress.py --nodes 2 --concurrency 16 --duration 20 --index-only
+    python tests/agentic_stress.py --nodes 4 --push --block-size 128 --turns 3,6
 """
 
 import argparse
+import base64
+import shlex
 import asyncio
 import glob
 import json
@@ -96,6 +102,16 @@ class Config:
     slow_us: float = 0.0              # log every request slower than this (query or insert)
     rht_slots: int = 4                # RHT slots per bucket (W)
     flush_after_insert: bool = False  # drain async RHT writes before DONE
+    push: bool = False
+    push_evict: bool = False          # push with evict_local=True: migrate instead of copy
+    # cross-host: per-rank host IPs (empty = every rank on this host, loopback);
+    # ranks whose host differs from local_host are started through remote_cmd
+    # ("{host}" placeholder, e.g. "ssh root@{host} docker exec -i c python3 .../agentic_stress.py")
+    worker_hosts: str = ""
+    local_host: str = ""              # this launcher's IP as peers reach it; default worker_hosts[0]
+    remote_cmd: str = ""
+    remote_kill: str = ""             # optional cleanup template with {host} and {run_id}
+    remote_op: str = "zmq"            # remote-op transport: zmq (TCP) | dc (RDMA DC)
     # internal (filled by the launcher)
     run_id: str = ""
     etcd_port: int = 0
@@ -155,16 +171,33 @@ def parse_args():
     p.add_argument("--flush-after-insert", action="store_true",
                    default=d.flush_after_insert,
                    help="client.flush() after insert so RHT routes land before DONE")
+    p.add_argument("--push", action="store_true", default=d.push,
+                   help="after each insert push_async(rank=None) the turn to the RHT-chosen peer")
+    p.add_argument("--push-evict", action="store_true", default=d.push_evict,
+                   help="push with evict_local=True: drop the local copy once the target holds it (implies --push)")
+    p.add_argument("--worker-hosts", default=d.worker_hosts,
+                   help="comma list of per-rank host IPs; ranks not on --local-host start via --remote-cmd")
+    p.add_argument("--local-host", default=d.local_host)
+    p.add_argument("--remote-cmd", default=d.remote_cmd,
+                   help="command template ({host}) that runs this script on a remote rank's host")
+    p.add_argument("--remote-kill", default=d.remote_kill,
+                   help="cleanup template ({host}, {run_id}) run once per remote host")
+    p.add_argument("--remote-op", choices=["zmq", "dc"], default=d.remote_op,
+                   help="control-plane transport for remote ops (remote_query/allocate/insert)")
     # internal
     p.add_argument("--role", choices=["launcher", "worker"], default="launcher")
     p.add_argument("--rank", type=int, default=-1)
     p.add_argument("--config-json", default="")
+    p.add_argument("--config-b64", default="", help="base64(config json); survives ssh quoting")
     a = p.parse_args()
+    if a.config_b64:
+        a.config_json = base64.b64decode(a.config_b64).decode()
     if a.config_json:
         cfg = Config(**json.loads(a.config_json))
     else:
         cfg = Config(**{k: getattr(a, k) for k in Config.__dataclass_fields__
                         if hasattr(a, k)})
+    cfg.push = cfg.push or cfg.push_evict
     return cfg, a.role, a.rank
 
 
@@ -192,18 +225,22 @@ def server_config(cfg: Config, rank: int) -> radixshmem.ServerConfig:
     cluster = radixshmem.ClusterConfig()
     if cfg.nodes > 1:
         cluster = radixshmem.ClusterConfig(
-            expected_min_nodes=cfg.nodes, registry=f"etcd://127.0.0.1:{cfg.etcd_port}",
-            cluster_id=f"agentic_{cfg.run_id}", node_name=f"node{rank}", rpc_address="0.0.0.0",
+            expected_min_nodes=cfg.nodes, registry=f"etcd://{local_host(cfg)}:{cfg.etcd_port}",
+            cluster_id=f"agentic_{cfg.run_id}", node_name=f"node{rank}",
+            # cross-host peers dial this address; on one host the wildcard works
+            rpc_address=worker_hosts(cfg)[rank] if cfg.worker_hosts else "0.0.0.0",
             num_rht_shards=cfg.nodes, rht_shard_holders=list(range(cfg.nodes)),
             index_dev=dev[0] if dev else "", gid_idx=cfg.gid_idx,
             bootstrap_timeout_sec=cfg.bootstrap_timeout, rht_slots_per_bucket=cfg.rht_slots,
-            enable_remote_query=cfg.diag_misses)
+            enable_remote_query=cfg.diag_misses or cfg.push, enable_remote_insert=cfg.push,
+            remote_op_transport=cfg.remote_op)
     return radixshmem.ServerConfig(
         name=f"/agentic_{cfg.run_id}_r{rank}", data_bytes=data_bytes,
         swa_ratio=swa_bytes / data_bytes if data_bytes else 0.0,
         mamba_ratio=mamba_bytes / data_bytes if data_bytes else 0.0,
-        slot_align=64, transfer_devices=dev, max_nodes=cfg.max_nodes,
-        data_pool_ratio=cfg.data_pool_ratio, cluster=cluster)
+        slot_align=64, transfer_devices=dev,
+        transfer_ip=worker_hosts(cfg)[rank] if cfg.worker_hosts else "",
+        max_nodes=cfg.max_nodes, data_pool_ratio=cfg.data_pool_ratio, cluster=cluster)
 
 
 def geometry(cfg: Config) -> radixshmem.Geometry:
@@ -234,6 +271,24 @@ def kv_pattern(kind, hashes: np.ndarray, words: int) -> np.ndarray:
         h = ~h
     step = np.arange(words, dtype=np.uint64)
     return h[:, None] - step if kind == MAMBA else h[:, None] + step
+
+
+def worker_hosts(cfg: Config) -> List[str]:
+    """Host of each rank; loopback everywhere unless --worker-hosts was given."""
+    if not cfg.worker_hosts:
+        return ["127.0.0.1"] * cfg.nodes
+    hosts = [h for h in cfg.worker_hosts.split(",") if h]
+    if len(hosts) != cfg.nodes:
+        raise ValueError(f"--worker-hosts lists {len(hosts)} hosts for {cfg.nodes} nodes")
+    return hosts
+
+
+def local_host(cfg: Config) -> str:
+    return cfg.local_host or (worker_hosts(cfg)[0] if cfg.worker_hosts else "127.0.0.1")
+
+
+def is_remote(cfg: Config, rank: int) -> bool:
+    return bool(cfg.worker_hosts) and worker_hosts(cfg)[rank] != local_host(cfg)
 
 
 def rdma_devices(cfg: Config) -> List[str]:
@@ -305,6 +360,7 @@ class Worker:
         self.peak_depth = 0
         self.errors: Dict[str, int] = {}
         self.bad_blocks = 0
+        self.push_outcomes = {"capped": 0, "no_target": 0, "failed": 0, "partial": 0}
         self.lock = threading.Lock()
         # data mode: one uint64 view per pool, (num_slots, stride / 8)
         self.pools: Dict[object, np.ndarray] = {}
@@ -396,9 +452,9 @@ class Worker:
                 for r in range(c.world_size()):
                     if r == self.own:
                         continue
-                    try:   # remote_query caps requests at 512 blocks
-                        peer_hits[r] = int(c.remote_query(r, inp[:512], lock=False,
-                                                          update_meta=False).total_hit_length)
+                    try:
+                        peer_hits[r] = int(c.remote_query(r, inp[:radixshmem.MAX_REMOTE_OP_BLOCKS],
+                                                          lock=False, update_meta=False).total_hit_length)
                     except Exception as e:
                         peer_hits[r] = f"err:{type(e).__name__}"
             cs = self.cfg.register_chunk_size
@@ -461,6 +517,27 @@ class Worker:
             c.flush()
         insert_us = (time.perf_counter() - t1) * 1e6
 
+        push_us, push_blocks, push_bytes, push_evicted = 0.0, 0, 0, 0
+        if self.cfg.push and n > 0:
+            outcome = ""
+            if n > radixshmem.MAX_REMOTE_OP_BLOCKS:
+                outcome = "capped"
+            else:
+                t_p = time.perf_counter()
+                pr = c.push_async(hashes[:n], mask=self.mask, evict_local=self.cfg.push_evict).wait()
+                push_us = (time.perf_counter() - t_p) * 1e6
+                push_blocks, push_bytes = int(pr.remote_blocks), int(pr.remote_bytes)
+                push_evicted = int(pr.local_evicted)
+                if pr.target_rank < 0:
+                    outcome = "no_target"
+                elif pr.committed == 0:
+                    outcome = "failed"
+                elif pr.committed < n:
+                    outcome = "partial"
+            if outcome:
+                with self.lock:
+                    self.push_outcomes[outcome] += 1
+
         if err:
             with self.lock:
                 self.errors[err] = self.errors.get(err, 0) + 1
@@ -473,6 +550,8 @@ class Worker:
             "remote_hit": actual - int(local),
             "rdma_reads": rdma_reads, "rdma_atomics": rdma_atomics,
             "inserted_blocks": max(0, n - have), "finalize_us": finalize_us, "error": err,
+            "push_us": push_us, "push_blocks": push_blocks, "push_bytes": push_bytes,
+            "push_evicted": push_evicted,
             "diag": diag,
         }
 
@@ -522,9 +601,12 @@ class Worker:
             "peak_queue_depth": self.peak_depth,
             "errors": self.errors,
             "bad_blocks": self.bad_blocks,
-            "transfer_failures": c.transfer_failures,
-            "staging_shortfalls": c.staging_shortfalls,
-            "promotion_shortfalls": c.promotion_shortfalls,
+            "transfer_failures": c.pull_transfer_failures,
+            "staging_shortfalls": c.pull_staging_shortfalls,
+            "promotion_shortfalls": c.pull_promotion_shortfalls,
+            "push": {**self.push_outcomes, "transfer_failures": c.push_transfer_failures,
+                     "staging_shortfalls": c.push_staging_shortfalls,
+                     "commit_shortfalls": c.push_commit_shortfalls} if self.cfg.push else None,
             # end-of-run leak audit (locks / slots / pins); 0 == clean
             "health": int(c.check_health()),
             "health_report": c.health_report().describe().strip(),
@@ -541,7 +623,7 @@ def run_worker(cfg: Config, rank: int) -> int:
 
     ls = socket.socket()
     ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    ls.bind(("127.0.0.1", cfg.base_port + rank))
+    ls.bind(("0.0.0.0" if cfg.worker_hosts else "127.0.0.1", cfg.base_port + rank))
     ls.listen(1)
     print(f"READY {cfg.base_port + rank}")
     conn, _ = ls.accept()
@@ -638,7 +720,7 @@ class Recorder:
     FIELDS = ["t", "worker", "turn", "input_blocks", "history_blocks",
               "actual_hit", "local_hit", "remote_hit", "query_us", "insert_us",
               "insert_full_us", "rdma_reads", "rdma_atomics", "inserted_blocks", "verify_us",
-              "xfer_us", "remote_bytes"]
+              "xfer_us", "remote_bytes", "push_us", "push_blocks", "push_bytes", "push_evicted"]
 
     def __init__(self):
         self.rows: List[tuple] = []
@@ -661,7 +743,9 @@ class Recorder:
                           done["insert_us"], done["insert_full_us"],
                           done["rdma_reads"], done["rdma_atomics"],
                           done["inserted_blocks"], done.get("verify_us", 0.0),
-                          done.get("xfer_us", 0.0), done.get("remote_bytes", 0)))
+                          done.get("xfer_us", 0.0), done.get("remote_bytes", 0),
+                          done.get("push_us", 0.0), done.get("push_blocks", 0),
+                          done.get("push_bytes", 0), done.get("push_evicted", 0)))
         if done["error"]:
             self.errors[done["error"]] = self.errors.get(done["error"], 0) + 1
         if self.miss_log is not None and done["actual_hit"] < req["history_blocks"]:
@@ -687,7 +771,8 @@ class Recorder:
                              "inserted_blocks")}}) + "\n")
             self.slow_log.flush()
         self.win.append((now, done["actual_hit"], req["history_blocks"],
-                         done["query_us"], done["insert_us"], done.get("remote_bytes", 0)))
+                         done["query_us"], done["insert_us"], done.get("remote_bytes", 0),
+                         done.get("push_bytes", 0)))
 
     def phase(self, now: float) -> str:
         if self.t_drain and now >= self.t_drain:
@@ -704,9 +789,11 @@ class Recorder:
         q99 = np.percentile([x[3] for x in w], 99)
         i99 = np.percentile([x[4] for x in w], 99)
         mbps = sum(x[5] for x in w) / 10 / 1e6
+        pmbps = sum(x[6] for x in w) / 10 / 1e6
         return (f"[{now - self.t_start:6.1f}s] {len(w) / 10:7.1f} req/s  "
                 f"hit/theory={act / max(th, 1):.3f}  query p99={q99:8.0f}us  "
                 f"insert p99={i99:8.0f}us  " + (f"xfer={mbps:7.2f}MB/s  " if mbps else "")
+                + (f"push={pmbps:7.2f}MB/s  " if pmbps else "")
                 + f"sessions={self.sessions_done}  in-flight={in_flight}")
 
 
@@ -757,7 +844,7 @@ async def session_loop(cfg: Config, conns: List[WorkerConn], rec: Recorder,
 async def run_generator(cfg: Config) -> dict:
     conns: List[WorkerConn] = []
     for i in range(cfg.nodes):
-        r, w = await asyncio.open_connection("127.0.0.1", cfg.base_port + i)
+        r, w = await asyncio.open_connection(worker_hosts(cfg)[i], cfg.base_port + i)
         w.get_extra_info("socket").setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         conns.append(WorkerConn(i, r, w))
     readers = [asyncio.create_task(c.read_loop()) for c in conns]
@@ -853,7 +940,8 @@ def hit_block(rows: np.ndarray) -> dict:
 
 
 def build_report(cfg: Config, rec: Recorder, stats: List[Optional[dict]]) -> dict:
-    all_rows = np.array(rec.rows, dtype=np.float64) if rec.rows else np.zeros((0, 17))
+    all_rows = (np.array(rec.rows, dtype=np.float64) if rec.rows
+                else np.zeros((0, len(Recorder.FIELDS))))
     steady = all_rows[all_rows[:, 0] >= rec.t_steady] if rec.t_steady else all_rows
     drain = steady[steady[:, 0] >= rec.t_drain] if rec.t_drain else steady[:0]
     span = max(rec.t_end - (rec.t_steady or rec.t_start), 1e-9)
@@ -892,6 +980,17 @@ def build_report(cfg: Config, rec: Recorder, stats: List[Optional[dict]]) -> dic
                 "bandwidth_mbps": pct(rb[remote] / np.maximum(xs[remote], 1e-9) / 1e6) if remote.any() else {},
                 "xfer_us": pct(steady[remote, 15]) if remote.any() else {},
             }
+        if cfg.push:
+            pu, pb = steady[:, 17], steady[:, 19]
+            ran, moved = pu > 0, pb > 0
+            rep["push"] = {   # Slot counts include all lanes.
+                "pushed_bytes": float(pb.sum()), "pushed_slots": float(steady[:, 18].sum()),
+                "evicted_blocks": float(steady[:, 20].sum()),
+                "push_requests": int(ran.sum()), "moving_requests": int(moved.sum()),
+                "aggregate_mbps": float(pb.sum() / span / 1e6),
+                "push_us": pct(pu[ran]) if ran.any() else {},
+                "bandwidth_mbps": pct(pb[moved] / np.maximum(pu[moved], 1e-9)) if moved.any() else {},
+            }
         for w in range(cfg.nodes):
             r = steady[steady[:, 1] == w]
             if r.size:
@@ -924,6 +1023,7 @@ def print_report(rep: dict):
           f"concurrency={rep['config']['concurrency']}  aux={rep['config']['aux']}  "
           f"W={rep['config']['swa_window']}  cs={rep['config']['register_chunk_size']}  "
           f"rht_slots={rep['config']['rht_slots']}  flush={rep['config']['flush_after_insert']}  "
+          f"push={rep['config']['push']}{'+evict' if rep['config']['push_evict'] else ''}  "
           f"max_blocks={rep['config']['max_blocks']}")
     print(f"warmup {t['warmup_sec']:.1f}s  measured {t['measured_sec']:.1f}s "
           f"(incl. drain {t['drain_sec']:.1f}s / {t['drain_requests']} req)")
@@ -943,6 +1043,16 @@ def print_report(rep: dict):
         if x["bandwidth_mbps"]:
             print(f"     per-request MB/s {fmt_lat(x['bandwidth_mbps'])}")
             print(f"     wait us         {fmt_lat(x['xfer_us'])}")
+    pu = rep.get("push")
+    if pu:
+        print(f"push: {pu['pushed_bytes'] / 1e6:.2f} MB / {pu['pushed_slots']:.0f} slots in "
+              f"{pu['moving_requests']} of {pu['push_requests']} pushes  "
+              f"aggregate {pu['aggregate_mbps']:.2f} MB/s"
+              + (f"  evicted {pu['evicted_blocks']:.0f} blocks" if rep["config"]["push_evict"] else ""))
+        if pu["push_us"]:
+            print(f"     push us         {fmt_lat(pu['push_us'])}")
+        if pu["bandwidth_mbps"]:
+            print(f"     per-push MB/s   {fmt_lat(pu['bandwidth_mbps'])}")
     print("latency (us):" + ("" if rep["config"]["index_only"] else "   query = pull_async + wait"))
     for k in ("query", "verify", "insert", "insert_full"):
         if k in rep["latency_us"] or k != "verify":
@@ -972,6 +1082,8 @@ def print_report(rep: dict):
                   f"staging_short={s.get('staging_shortfalls', 0)}  "
                   f"promo_short={s.get('promotion_shortfalls', 0)}  "
                   f"health={'ok' if s.get('health', 0) == 0 else f'0x{s["health"]:x}'}")
+            if s.get("push"):
+                print("      push: " + "  ".join(f"{k}={v}" for k, v in s["push"].items()))
             if s.get("health", 0):
                 for line in s["health_report"].splitlines():
                     print(f"      {line}")
@@ -992,14 +1104,15 @@ def free_port() -> int:
     return port
 
 
-def start_etcd(workdir: str):
+def start_etcd(workdir: str, advertise: str = "127.0.0.1"):
     cport, pport = free_port(), free_port()
     log = open(os.path.join(workdir, "etcd.log"), "wb")
+    listen = "127.0.0.1" if advertise == "127.0.0.1" else "0.0.0.0"
     proc = subprocess.Popen(
         ["etcd", "--name", "agentic",
          "--data-dir", os.path.join(workdir, "etcd-data"),
-         "--listen-client-urls", f"http://127.0.0.1:{cport}",
-         "--advertise-client-urls", f"http://127.0.0.1:{cport}",
+         "--listen-client-urls", f"http://{listen}:{cport}",
+         "--advertise-client-urls", f"http://{advertise}:{cport}",
          "--listen-peer-urls", f"http://127.0.0.1:{pport}",
          "--initial-advertise-peer-urls", f"http://127.0.0.1:{pport}",
          "--initial-cluster", f"agentic=http://127.0.0.1:{pport}"],
@@ -1019,12 +1132,18 @@ def start_etcd(workdir: str):
 def spawn_workers(cfg: Config, workdir: str):
     procs, ready = [], [threading.Event() for _ in range(cfg.nodes)]
     cfg_json = json.dumps(asdict(cfg))
+    cfg_b64 = base64.b64encode(cfg_json.encode()).decode()
     for i in range(cfg.nodes):
         log = open(os.path.join(workdir, f"worker{i}.log"), "wb")
-        p = subprocess.Popen([sys.executable, os.path.abspath(__file__),
-                              "--role", "worker", "--rank", str(i),
-                              "--config-json", cfg_json],
-                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        if is_remote(cfg, i):
+            if not cfg.remote_cmd:
+                raise ValueError(f"rank {i} lives on {worker_hosts(cfg)[i]} but --remote-cmd is unset")
+            argv = shlex.split(cfg.remote_cmd.format(host=worker_hosts(cfg)[i])) + [
+                "--role", "worker", "--rank", str(i), "--config-b64", cfg_b64]
+        else:
+            argv = [sys.executable, os.path.abspath(__file__),
+                    "--role", "worker", "--rank", str(i), "--config-json", cfg_json]
+        p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              env=dict(os.environ, PYTHONUNBUFFERED="1"))
         procs.append(p)
 
@@ -1058,6 +1177,10 @@ def cleanup(procs, etcd, cfg: Config):
             p.wait(timeout=15)
         except subprocess.TimeoutExpired:
             p.kill()
+    if cfg.remote_kill:
+        for host in sorted({h for r, h in enumerate(worker_hosts(cfg)) if is_remote(cfg, r)}):
+            subprocess.run(shlex.split(cfg.remote_kill.format(host=host, run_id=cfg.run_id)),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=False)
     if etcd is not None and etcd.poll() is None:
         etcd.terminate()
         try:
@@ -1082,13 +1205,17 @@ def run_launcher(cfg: Config) -> int:
         if missing:
             print(f"SKIP: --nodes {cfg.nodes} needs {', '.join(missing)}")
             return 77
+    if cfg.push and (cfg.index_only or cfg.nodes < 2):
+        print("--push needs data mode and more than one node")
+        return 2
     cfg.run_id = f"{os.getpid():x}{int(time.time()) & 0xffff:x}"
     workdir = cfg.workdir or f"/tmp/agentic_stress_{os.getpid()}"
     os.makedirs(workdir, exist_ok=True)
     cfg.workdir = workdir
     print(f"run_id={cfg.run_id} workdir={workdir}")
     print(f"per-node index: full_slots={cfg.max_blocks} max_nodes={cfg.max_nodes} aux={cfg.aux} "
-          f"data_pool_ratio={cfg.data_pool_ratio}  rdma_devs={rdma_devices(cfg) or ['<auto>']}")
+          f"data_pool_ratio={cfg.data_pool_ratio}  rdma_devs={rdma_devices(cfg) or ['<auto>']}"
+          f"  remote_op={cfg.remote_op}")
     if not cfg.index_only:
         sc = server_config(cfg, 0)
         print(f"per-node store: {sc.data_bytes / 2**30:.2f} GiB  ratios swa={sc.swa_ratio:.4f} "
@@ -1099,8 +1226,9 @@ def run_launcher(cfg: Config) -> int:
     procs = []
     try:
         if cfg.nodes > 1:
-            etcd, cfg.etcd_port = start_etcd(workdir)
-            print(f"etcd on 127.0.0.1:{cfg.etcd_port}")
+            etcd, cfg.etcd_port = start_etcd(workdir, local_host(cfg))
+            print(f"etcd on {local_host(cfg)}:{cfg.etcd_port}"
+                  + (f"  workers on {worker_hosts(cfg)}" if cfg.worker_hosts else ""))
         procs, ready = spawn_workers(cfg, workdir)
         deadline = time.time() + cfg.bootstrap_timeout + 60
         for i, ev in enumerate(ready):
