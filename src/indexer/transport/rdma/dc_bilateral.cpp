@@ -65,7 +65,7 @@ DcClientTransport::~DcClientTransport() {
 
 RemoteStatus DcClientTransport::send_request(const void* req, size_t len,
                                              uint64_t req_id,
-                                             std::vector<char>& reply_out) {
+                                             std::vector<char>& reply_out, int max_attempts) {
     if (sizeof(DcCtrlHeader) + len > send_buf_.size())
         return RemoteStatus::BAD_REPLY;   // caller bug
 
@@ -83,7 +83,8 @@ RemoteStatus DcClientTransport::send_request(const void* req, size_t len,
 
     const uint32_t wire_len = (uint32_t)(sizeof(hdr) + len);
 
-    for (int attempt = 0; attempt < max_retry_; ++attempt) {
+    const int attempts = max_attempts > 0 ? max_attempts : max_retry_;
+    for (int attempt = 0; attempt < attempts; ++attempt) {
         std::memcpy(send_buf_.data(), &hdr, sizeof(hdr));
         std::memcpy(send_buf_.data() + sizeof(hdr), req, len);
         try {

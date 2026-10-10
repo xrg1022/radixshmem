@@ -53,7 +53,7 @@ public:
     DcClientTransport& operator=(const DcClientTransport&) = delete;
 
     RemoteStatus send_request(const void* req, size_t len, uint64_t req_id,
-                              std::vector<char>& reply_out) override;
+                              std::vector<char>& reply_out, int max_attempts = 0) override;
 
 private:
     DcInitiator& ini_;          // borrowed (per-process)

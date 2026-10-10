@@ -14,6 +14,7 @@
 #include "rdma_test_env.h"
 #include "etcd_test_harness.hpp"
 #include "test_utils.h"
+#include "cluster_protocol.h"
 #include "radix_client.h"
 #include "radix_server.h"
 #include "types.h"
@@ -60,8 +61,14 @@ int run_server_process(const std::string& node, const std::string& registry,
     radixshmem::RadixServerConfig cfg;
     cfg.name        = kShmPrefix;
     cfg.shm.hugepage_path = "";
-    cfg.shm.max_blocks = 4096;
+    cfg.shm.max_blocks = 4 * radixshmem::MAX_REMOTE_OP_BLOCKS;
     cfg.shm.block_size = kBlockSize;
+    cfg.shm.component_mask = radixshmem::COMPONENT_MASK_FULL | radixshmem::COMPONENT_MASK_SWA |
+                             radixshmem::COMPONENT_MASK_MAMBA;
+    cfg.shm.swa_window_blocks = 4;
+    cfg.shm.swa_max_blocks    = 256;
+    cfg.shm.mamba_max_slots   = 64;
+    cfg.rht_slots_per_bucket  = 2;   // Both ranks route hashes[0] in probe_target.
     cfg.expected_min_nodes = kWorldSize;
     cfg.registry    = registry;
     cfg.cluster_id  = cluster_id;
@@ -499,6 +506,223 @@ int run_timeout_and_rebuild() {
     }
 }
 
+bool b_swa_pool_whole() {
+    radixshmem::RadixClient b(shm_name_for(kTargetRank));
+    const int total = (int)b.swa_mempool_total();
+    std::vector<int32_t> tmp;
+    const int got = b.allocate_slots(total, tmp, radixshmem::ComponentType::SWA);
+    if (got > 0) b.recycle_slots(tmp.data(), got, radixshmem::ComponentType::SWA);
+    return got == total;
+}
+
+int run_aux_lifecycle() {
+    try {
+        using radixshmem::ComponentType;
+        const int n = 16, k = 4;
+        auto h = make_hashes(7200, n);
+        radixshmem::RadixClient cli(shm_name_for(kInitiatorRank));
+        const auto bad = static_cast<ComponentType>(3);
+        if (cli.remote_allocate(kTargetRank, k, bad).status
+                != radixshmem::RemoteStatus::BAD_REQUEST) return 150;
+        int32_t slots[k] = {0, 1, 2, 3};
+        if (cli.remote_insert(kTargetRank, h.data(), k, 0, k, slots, true, bad).error
+                != radixshmem::InsertError::REMOTE_FAILED) return 151;
+        if (cli.remote_recycle(kTargetRank, slots, k, bad)
+                != radixshmem::RemoteStatus::BAD_REQUEST) return 152;
+
+        auto rep = cli.remote_allocate(kTargetRank, 8, ComponentType::SWA);
+        if (rep.status != radixshmem::RemoteStatus::OK || rep.slots.size() != 8) {
+            fprintf(stderr, "[aux-abort] allocate status=%d got=%zu\n",
+                    (int)rep.status, rep.slots.size());
+            return 160;
+        }
+        if (b_swa_pool_whole()) return 161;
+        if (cli.remote_recycle(kTargetRank, rep.slots.data(), 8, ComponentType::SWA)
+                != radixshmem::RemoteStatus::OK) return 162;
+        if (!b_swa_pool_whole()) return 163;
+
+        auto swa = cli.remote_allocate(kTargetRank, k, ComponentType::SWA);
+        if (swa.status != radixshmem::RemoteStatus::OK || (int)swa.slots.size() != k) return 170;
+        auto r = cli.remote_insert(kTargetRank, h.data(), n, 0, k, swa.slots.data(), true,
+                                   ComponentType::SWA);
+        if (r.error != radixshmem::InsertError::FULL_PATH_MISSING ||
+            (int)r.unused_slots.size() != k) {
+            fprintf(stderr, "[aux-miss] error=%d unused=%zu\n", (int)r.error,
+                    r.unused_slots.size());
+            return 171;
+        }
+        if (!b_swa_pool_whole()) return 172;
+
+        // Auxiliary publication requires an existing FULL path.
+        auto full = cli.remote_allocate(kTargetRank, n);
+        if (full.status != radixshmem::RemoteStatus::OK || (int)full.slots.size() != n) return 180;
+        if (cli.remote_insert(kTargetRank, h.data(), n, 0, n, full.slots.data()).error
+                != radixshmem::InsertError::OK) return 181;
+        // SWA: k trailing cells [n-k, n), start = 0.
+        swa = cli.remote_allocate(kTargetRank, k, ComponentType::SWA);
+        if (swa.status != radixshmem::RemoteStatus::OK || (int)swa.slots.size() != k) return 182;
+        if (cli.remote_insert(kTargetRank, h.data(), n, 0, k, swa.slots.data(), true,
+                              ComponentType::SWA).error != radixshmem::InsertError::OK) return 183;
+        // MAMBA: one checkpoint at END n.
+        auto mb = cli.remote_allocate(kTargetRank, 1, ComponentType::MAMBA);
+        if (mb.status != radixshmem::RemoteStatus::OK || mb.slots.size() != 1) return 184;
+        if (cli.remote_insert(kTargetRank, h.data(), n, 0, 1, mb.slots.data(), true,
+                              ComponentType::MAMBA).error != radixshmem::InsertError::OK) return 185;
+        {
+            radixshmem::RadixClient b(shm_name_for(kTargetRank));
+            auto bq = b.query(h.data(), n,
+                              radixshmem::COMPONENT_MASK_FULL | radixshmem::COMPONENT_MASK_SWA |
+                                  radixshmem::COMPONENT_MASK_MAMBA,
+                              /*local_only=*/true);
+            if (bq.common_hit != n) {
+                fprintf(stderr, "[aux] joint hit=%d expected %d\n", bq.common_hit, n);
+                return 186;
+            }
+            if (bq.swa.offset != n - k || bq.swa.slot_ids != swa.slots) return 187;
+            if (!bq.mamba || bq.mamba->slot_id != mb.slots[0]) return 188;
+        }
+        // Duplicate MAMBA checkpoints keep the first writer's slot.
+        auto mb2 = cli.remote_allocate(kTargetRank, 1, ComponentType::MAMBA);
+        if (mb2.status != radixshmem::RemoteStatus::OK || mb2.slots.size() != 1) return 189;
+        auto dup = cli.remote_insert(kTargetRank, h.data(), n, 0, 1, mb2.slots.data(), true,
+                                     ComponentType::MAMBA);
+        if (dup.error != radixshmem::InsertError::OK || dup.unused_slots.size() != 1) return 190;
+        fprintf(stderr, "[aux] OK bad component, abort, missing FULL, SWA/MAMBA publish and dedup\n");
+        return 0;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[aux] exception: %s\n", e.what());
+        return 191;
+    }
+}
+
+int run_probe_target() {
+    try {
+        const int n = 16, head_n = 8;
+        auto h = make_hashes(9000, n);
+        std::vector<radixshmem::HashType> head(h.begin(), h.begin() + head_n);
+        radixshmem::RadixClient cli(shm_name_for(kInitiatorRank));
+        if (!cli.is_distributed()) return 200;
+
+        auto p0 = cli.rht_probe(h.data(), n);
+        if (p0.rank != -1 || p0.depth != 0) {
+            fprintf(stderr, "[probe] empty: rank=%d depth=%d\n", p0.rank, p0.depth);
+            return 201;
+        }
+        if (seed_prefix_on_B(head, /*pin=*/false) != head_n) return 202;
+        // Keep the head separate so the extension requires a chain hop.
+        auto mb = cli.remote_allocate(kTargetRank, 1, radixshmem::ComponentType::MAMBA);
+        if (mb.status != radixshmem::RemoteStatus::OK || mb.slots.size() != 1) return 213;
+        if (cli.remote_insert(kTargetRank, head.data(), head_n, 0, 1, mb.slots.data(), true,
+                              radixshmem::ComponentType::MAMBA).error != radixshmem::InsertError::OK)
+            return 214;
+        auto p1 = cli.rht_probe(h.data(), n);
+        if (p1.rank != kTargetRank || p1.depth != head_n) {
+            fprintf(stderr, "[probe] head: rank=%d depth=%d\n", p1.rank, p1.depth);
+            return 203;
+        }
+        if (insert_auto_local(cli, h.data(), n) != n) return 204;
+        cli.flush();
+        auto p2 = cli.rht_probe(h.data(), n);
+        if (p2.rank != kTargetRank || p2.depth != head_n) {
+            fprintf(stderr, "[probe] self-routed: rank=%d depth=%d\n", p2.rank, p2.depth);
+            return 205;
+        }
+        // hashes[8] is not a probe position; finding the extension requires a chain hop.
+        if (seed_prefix_on_B(h, /*pin=*/false) != n - head_n) return 206;
+        auto p3 = cli.rht_probe(h.data(), n);
+        if (p3.rank != kTargetRank || p3.depth != n) {
+            fprintf(stderr, "[probe] extended: rank=%d depth=%d\n", p3.rank, p3.depth);
+            return 207;
+        }
+        auto p4 = cli.rht_probe(h.data(), 4);
+        if (p4.rank != kTargetRank || p4.depth != 4) {
+            fprintf(stderr, "[probe] clamp: rank=%d depth=%d\n", p4.rank, p4.depth);
+            return 208;
+        }
+        {
+            radixshmem::RadixClient b(shm_name_for(kTargetRank));
+            auto pb = b.rht_probe(h.data(), n);
+            if (pb.rank != kInitiatorRank || pb.depth != n) {
+                fprintf(stderr, "[probe] from B: rank=%d depth=%d\n", pb.rank, pb.depth);
+                return 209;
+            }
+        }
+        evict_pressure_on_B();
+        if (b_local_hit(h) != 0) return 210;
+        auto p5 = cli.rht_probe(h.data(), n);
+        if (p5.rank != -1) {
+            fprintf(stderr, "[probe] after evict: rank=%d depth=%d\n", p5.rank, p5.depth);
+            return 211;
+        }
+        fprintf(stderr, "[probe] OK head=%d self skipped chain=%d clamp evict→miss\n",
+                head_n, n);
+        return 0;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[probe] exception: %s\n", e.what());
+        return 212;
+    }
+}
+
+int run_long_prefix() {
+    try {
+        const int n = radixshmem::MAX_REMOTE_OP_BLOCKS;
+        auto h = make_hashes(20000, n + 1);
+        radixshmem::RadixClient cli(shm_name_for(kInitiatorRank));
+
+        if (cli.remote_query(kTargetRank, h.data(), n + 1).status != radixshmem::RemoteStatus::BAD_REQUEST)
+            return 220;
+        if (cli.remote_allocate(kTargetRank, n + 1).status != radixshmem::RemoteStatus::BAD_REQUEST)
+            return 221;
+        auto q0 = cli.remote_query(kTargetRank, h.data(), n);
+        if (q0.status != radixshmem::RemoteStatus::OK || q0.total_hit_length != 0) {
+            fprintf(stderr, "[cap] empty query status=%d hit=%d\n", (int)q0.status, q0.total_hit_length);
+            return 222;
+        }
+        auto rep = cli.remote_allocate(kTargetRank, n);
+        if (rep.status != radixshmem::RemoteStatus::OK || (int)rep.slots.size() != n) {
+            fprintf(stderr, "[cap] allocate status=%d slots=%zu\n", (int)rep.status, rep.slots.size());
+            return 223;
+        }
+        auto ins = cli.remote_insert(kTargetRank, h.data(), n, 0, n, rep.slots.data());
+        if (ins.error != radixshmem::InsertError::OK || !ins.unused_slots.empty()) {
+            fprintf(stderr, "[cap] insert error=%d unused=%zu\n", (int)ins.error, ins.unused_slots.size());
+            return 224;
+        }
+        auto q1 = cli.remote_query(kTargetRank, h.data(), n);
+        if (q1.status != radixshmem::RemoteStatus::OK || q1.total_hit_length != n ||
+            q1.remote_slots != rep.slots) {
+            fprintf(stderr, "[cap] full query status=%d hit=%d slots=%zu\n", (int)q1.status,
+                    q1.total_hit_length, q1.remote_slots.size());
+            return 225;
+        }
+        if (b_local_hit(std::vector<radixshmem::HashType>(h.begin(), h.begin() + n)) != n) return 226;
+
+        // Leave n/2 slots free to verify a partial FULL grant.
+        int granted = 0;
+        {
+            radixshmem::RadixClient b(shm_name_for(kTargetRank));
+            (void)pin_path(b, h.data(), n);                          // handle dropped: stays pinned
+            int fill = (int)b.mempool_total() - (int)b.mempool_used() - n / 2;
+            if (fill <= 0) return 228;
+            if (seed_prefix_on_B(make_hashes(30000, fill), /*pin=*/true) != fill) return 229;
+        }
+        auto part = cli.remote_allocate(kTargetRank, n);
+        granted = (int)part.slots.size();
+        if (part.status != radixshmem::RemoteStatus::OK || granted <= 0 || granted >= n) {
+            fprintf(stderr, "[cap] partial allocate status=%d granted=%d\n", (int)part.status, granted);
+            return 230;
+        }
+        if (cli.remote_recycle(kTargetRank, part.slots.data(), granted) != radixshmem::RemoteStatus::OK)
+            return 231;
+        fprintf(stderr, "[cap] OK %d-hash query/allocate/insert round-trip, %d refused, "
+                "short pool granted %d of %d\n", n, n + 1, granted, n);
+        return 0;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[cap] exception: %s\n", e.what());
+        return 227;
+    }
+}
+
 // Client-case dispatch for the re-exec'd child (no etcd argv — the name-attach
 // ctor reads cluster coordinates from the shm header the server stamped).
 int client_main(int argc, char** argv) {
@@ -510,6 +734,9 @@ int client_main(int argc, char** argv) {
     if (cs == "insert_finalize")   return run_insert_finalize();
     if (cs == "release_abort")     return run_release_abort();
     if (cs == "full_dedup")        return run_full_dedup();
+    if (cs == "aux_lifecycle")    return run_aux_lifecycle();
+    if (cs == "probe_target")      return run_probe_target();
+    if (cs == "long_prefix")       return run_long_prefix();
     if (cs == "timeout_rebuild") {
         // argv[3]/argv[4]: fd numbers for parent sync (survive execv).
         g_to_parent_fd   = std::atoi(argv[3]);
@@ -585,6 +812,9 @@ int main(int argc, char** argv) {
     run_case("insert_finalize");   // #7
     run_case("release_abort");     // #8
     run_case("full_dedup");        // #9
+    run_case("aux_lifecycle");
+    run_case("probe_target");
+    run_case("long_prefix");
 
     // #2/#3 last: pipe-synchronized kill of B (nothing runs after it). The child
     // is re-exec'd; the two sync-pipe fd numbers ride on its argv (not CLOEXEC).

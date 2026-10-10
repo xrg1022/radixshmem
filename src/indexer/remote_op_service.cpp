@@ -61,6 +61,48 @@ std::vector<char> make_status_reply(const RemoteOpReqHeader& req, RemoteStatus s
     return buf;
 }
 
+bool valid_commit(const RemoteOpReqHeader& req, size_t bytes) {
+    const int count = req.u.commit.num_entries;
+    const int num_slots = req.u.commit.num_slots;
+    if (req.n <= 0 || count <= 0 || count > 1 + 2 * req.n ||
+        num_slots <= 0 || num_slots > 3 * req.n || req.flags != 0 ||
+        req.component != (uint8_t)ComponentType::FULL) return false;
+    const size_t desc_off = sizeof(req) + (size_t)req.n * sizeof(uint64_t);
+    const size_t want = desc_off + (size_t)count * sizeof(RemoteCommitEntry) +
+                        (size_t)num_slots * sizeof(int32_t);
+    if (bytes != want) return false;
+    const auto* entries = reinterpret_cast<const RemoteCommitEntry*>(
+        reinterpret_cast<const char*>(&req) + desc_off);
+    int totals[3] = {};
+    for (int i = 0; i < count; ++i) {
+        const auto& e = entries[i];
+        const auto comp = static_cast<ComponentType>(e.component);
+        if (!valid_remote_entry(comp, e.at, e.num_slots, req.n, i == 0, totals))
+            return false;
+    }
+    return totals[0] + totals[1] + totals[2] == num_slots;
+}
+
+bool valid_prepare(const RemoteOpReqHeader& req, size_t bytes) {
+    const int full_hit = req.u.prepare.full_hit;
+    const int count = req.u.prepare.num_entries;
+    if (req.n <= 0 || full_hit < 0 || full_hit > req.n || count < 0 ||
+        count > 2 * full_hit || req.flags != 0 ||
+        req.component != (uint8_t)ComponentType::FULL) return false;
+    const size_t desc_off = sizeof(req) + (size_t)req.n * sizeof(uint64_t);
+    if (bytes != desc_off + (size_t)count * sizeof(RemoteCommitEntry)) return false;
+    const auto* entries = reinterpret_cast<const RemoteCommitEntry*>(
+        reinterpret_cast<const char*>(&req) + desc_off);
+    int totals[3] = {};
+    for (int i = 0; i < count; ++i) {
+        const auto& e = entries[i];
+        const auto comp = static_cast<ComponentType>(e.component);
+        if (!valid_remote_entry(comp, e.at, e.num_slots, full_hit, false, totals))
+            return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 RemoteOpAddr RadixServer::rc_build_endpoint(uint32_t rot_auth,
@@ -138,16 +180,21 @@ void RadixServer::rc_stop() {
 
 std::vector<char> RadixServer::handle_insert(const RemoteOpReqHeader& req,
                                              const uint64_t* /*hashes*/) {
-    // ALLOCATE: pure slot alloc of req.n (no hashes, no dedup). Dedup happens
-    // in the phase-2 INSERT (local insert consumes only the unmatched tail).
+    // Reserve from the component pool; dedup is deferred to INSERT.
+    const auto comp = static_cast<ComponentType>(req.component);
     std::vector<int32_t> slots;
     uint16_t error = static_cast<uint16_t>(InsertError::OK);
     if (req.n > 0) {
         std::lock_guard<std::mutex> g(svc_client_mu_);
-        int got = svc_tree_->allocate_slots(req.n, slots);
+        // FULL allows partial grants; auxiliary pools are all-or-none.
+        const bool full = comp == ComponentType::FULL;
+        int n = full ? std::min<int>(req.n, (int)svc_tree_->tree().mempool_total()) : req.n;
+        int got = svc_tree_->allocate_slots(n, slots, comp);
         if (got < req.n) {
-            svc_tree_->recycle_slots(slots.data(), got);
-            slots.clear();
+            if (!full) {
+                svc_tree_->recycle_slots(slots.data(), got, comp);
+                slots.clear();
+            }
             error = static_cast<uint16_t>(InsertError::MEMPOOL_FULL);
         }
     }
@@ -174,6 +221,7 @@ std::vector<char> RadixServer::handle_insert(const RemoteOpReqHeader& req,
 std::vector<char> RadixServer::handle_finalize_like(const RemoteOpReqHeader& req,
                                                     const uint64_t* hashes) {
     const auto& f = req.u.insert;
+    const auto comp = static_cast<ComponentType>(req.component);
     const int32_t* slots = reinterpret_cast<const int32_t*>(hashes + req.n);
     uint16_t error = 0;
     std::vector<int32_t> unused;   // INSERT: slots this publish did not consume
@@ -183,12 +231,12 @@ std::vector<char> RadixServer::handle_finalize_like(const RemoteOpReqHeader& req
             // Recycle by flag: unset → server recycles; set → initiator recycles.
             bool ar = !(req.flags & REMOTE_OP_FLAG_NO_AUTO_RECYCLE);
             InsertResult r = svc_client_->insert(hashes, req.n, slots, f.length,
-                                                 f.start, /*auto_recycle=*/ar);
+                                                 f.start, /*auto_recycle=*/ar, comp);
             error  = static_cast<uint16_t>(r.error);
             unused = std::move(r.unused_slots);
         } else if (req.op == REMOTE_OP_INSERT_RELEASE) {
-            svc_tree_->recycle_slots(slots, f.length);
-        } else {   // REMOTE_OP_QUERY_RELEASE
+            svc_tree_->recycle_slots(slots, f.length, comp);
+        } else {   // QUERY_RELEASE is FULL-only.
             // Drop the pin a query(lock=true) placed: rebuild the fully-inside
             // record from the wire range and release through the component pair.
             PinRecord pin;
@@ -240,6 +288,121 @@ std::vector<char> RadixServer::handle_query(const RemoteOpReqHeader& req,
     return buf;
 }
 
+std::vector<char> RadixServer::handle_commit(const RemoteOpReqHeader& req,
+                                             const uint64_t* hashes) {
+    const int count = req.u.commit.num_entries;
+    const auto* entries = reinterpret_cast<const RemoteCommitEntry*>(hashes + req.n);
+    const auto* pending = reinterpret_cast<const int32_t*>(entries + count);
+    std::vector<char> buf(sizeof(RemoteOpReplyHeader) + (size_t)count * sizeof(uint32_t));
+    auto* rep = reinterpret_cast<RemoteOpReplyHeader*>(buf.data());
+    *rep = {};
+    rep->magic = REMOTE_OP_REPLY_MAGIC;
+    rep->version = REMOTE_OP_PROTOCOL_VERSION;
+    rep->op = REMOTE_OP_COMMIT;
+    rep->status = static_cast<uint16_t>(RemoteStatus::OK);
+    rep->req_id = req.req_id;
+    rep->u.commit.num_entries = count;
+    auto* errors = reinterpret_cast<uint32_t*>(rep + 1);
+    auto full_hit = [&]() {
+        return (int)svc_tree_->tree().query_components(hashes, req.n, COMPONENT_MASK_FULL,
+                                                      false, false).common_hit;
+    };
+    std::lock_guard<std::mutex> g(svc_client_mu_);
+    int next = 0, hit = 0;
+    bool full_ok = false;
+    try {
+        while (next < count) {
+            const int i = next++;
+            const auto& e = entries[i];
+            const auto comp = static_cast<ComponentType>(e.component);
+            const int32_t* slots = pending;
+            pending += e.num_slots;
+            if (i > 0 && !full_ok) {
+                svc_tree_->recycle_slots(slots, e.num_slots, comp);
+                errors[i] = static_cast<uint32_t>(InsertError::FULL_PATH_MISSING);
+                continue;
+            }
+            auto r = svc_client_->insert(hashes, e.at, slots, e.num_slots,
+                                          i == 0 ? e.at - e.num_slots : 0, true, comp);
+            errors[i] = static_cast<uint32_t>(r.error);
+            if (i == 0) {
+                hit = full_hit();
+                full_ok = r.error == InsertError::OK && hit == req.n;
+                if (r.error == InsertError::OK && !full_ok)
+                    errors[i] = static_cast<uint32_t>(InsertError::FULL_PATH_MISSING);
+            }
+        }
+        rep->u.commit.hit_length = count == 1 ? hit : full_hit();
+    } catch (...) {
+        // Only unattempted entries remain unambiguously owned by this request.
+        while (next < count) {
+            const auto& e = entries[next++];
+            svc_tree_->recycle_slots(pending, e.num_slots,
+                                     static_cast<ComponentType>(e.component));
+            pending += e.num_slots;
+        }
+        throw;
+    }
+    return buf;
+}
+
+std::vector<char> RadixServer::handle_prepare(const RemoteOpReqHeader& req,
+                                              const uint64_t* hashes) {
+    const auto* entries = reinterpret_cast<const RemoteCommitEntry*>(hashes + req.n);
+    std::vector<int32_t> grants[3];
+    std::lock_guard<std::mutex> g(svc_client_mu_);
+    try {
+        const int hit = (int)svc_tree_->tree().query_components(
+            hashes, req.n, COMPONENT_MASK_FULL, false, false).common_hit;
+        if (req.u.prepare.full_hit > hit) {
+            const int count = std::min<int>(req.u.prepare.full_hit - hit,
+                                            (int)svc_tree_->tree().mempool_total());
+            svc_tree_->allocate_slots(count, grants[0], ComponentType::FULL);
+        }
+        if (!grants[0].empty()) {
+            const int end = hit + (int)grants[0].size();
+            int totals[3] = {};
+            for (int i = 0; i < req.u.prepare.num_entries; ++i) {
+                const auto& e = entries[i];
+                totals[e.component] += e.component == (uint8_t)ComponentType::SWA
+                    ? std::max(0, std::min(e.at, end) - (e.at - e.num_slots))
+                    : (e.at <= end ? 1 : 0);
+            }
+            for (int c = 1; c < 3; ++c) {
+                if (totals[c] == 0) continue;
+                const auto comp = static_cast<ComponentType>(c);
+                int got = svc_tree_->allocate_slots(totals[c], grants[c], comp);
+                if (got != totals[c]) {
+                    svc_tree_->recycle_slots(grants[c].data(), (int)grants[c].size(), comp);
+                    grants[c].clear();
+                }
+            }
+        }
+        const size_t num_slots = grants[0].size() + grants[1].size() + grants[2].size();
+        std::vector<char> buf(sizeof(RemoteOpReplyHeader) + num_slots * sizeof(int32_t));
+        auto* rep = reinterpret_cast<RemoteOpReplyHeader*>(buf.data());
+        *rep = {};
+        rep->magic = REMOTE_OP_REPLY_MAGIC;
+        rep->version = REMOTE_OP_PROTOCOL_VERSION;
+        rep->op = REMOTE_OP_PREPARE;
+        rep->status = static_cast<uint16_t>(RemoteStatus::OK);
+        rep->req_id = req.req_id;
+        rep->u.prepare = {hit, (int32_t)grants[0].size(), (int32_t)grants[1].size(),
+                         (int32_t)grants[2].size()};
+        auto* slots = reinterpret_cast<int32_t*>(rep + 1);
+        for (const auto& lane : grants) {
+            if (!lane.empty()) std::memcpy(slots, lane.data(), lane.size() * sizeof(int32_t));
+            slots += lane.size();
+        }
+        return buf;
+    } catch (...) {
+        for (int c = 0; c < 3; ++c)
+            svc_tree_->recycle_slots(grants[c].data(), (int)grants[c].size(),
+                                     static_cast<ComponentType>(c));
+        throw;
+    }
+}
+
 // Poller for one lane — the SOLE thread that polls that lane of rc_server_.
 void RadixServer::rc_loop(int lane) {
     std::vector<char> rbuf(REMOTE_OP_MAX_REQ_BYTES);
@@ -262,8 +425,13 @@ void RadixServer::rc_loop(int lane) {
                     auto* h = reinterpret_cast<RemoteOpReqHeader*>(rbuf.data());
                     bool ok = h->magic == REMOTE_OP_REQ_MAGIC &&
                               h->version == REMOTE_OP_PROTOCOL_VERSION &&
-                              h->n >= 0 && h->n <= MAX_REMOTE_OP_BLOCKS;
-                    if (ok) {
+                              h->n >= 0 && h->n <= MAX_REMOTE_OP_BLOCKS &&
+                              component_type_valid(static_cast<ComponentType>(h->component));
+                    if (ok && h->op == REMOTE_OP_COMMIT) {
+                        ok = valid_commit(*h, (size_t)got);
+                    } else if (ok && h->op == REMOTE_OP_PREPARE) {
+                        ok = valid_prepare(*h, (size_t)got);
+                    } else if (ok) {
                         // RESERVE carries no hashes (h->n is the alloc count);
                         // every other op is preceded by n hashes.
                         size_t want = sizeof(RemoteOpReqHeader) +
@@ -298,6 +466,10 @@ void RadixServer::rc_loop(int lane) {
                                     reply = handle_insert(*h, hashes); break;
                                 case REMOTE_OP_QUERY:
                                     reply = handle_query(*h, hashes); break;
+                                case REMOTE_OP_COMMIT:
+                                    reply = handle_commit(*h, hashes); break;
+                                case REMOTE_OP_PREPARE:
+                                    reply = handle_prepare(*h, hashes); break;
                                 case REMOTE_OP_INSERT:
                                 case REMOTE_OP_QUERY_RELEASE:
                                 case REMOTE_OP_INSERT_RELEASE:

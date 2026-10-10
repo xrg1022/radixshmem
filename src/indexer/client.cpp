@@ -554,7 +554,8 @@ InsertResult RadixClient::insert(const uint64_t* hashes, int n,
 // then the winner's route chain is followed to its end (rht_chain.h).
 int RadixClient::find_component_source(const uint64_t* hashes, int n,
                                        int incumbent,
-                                       std::vector<RemoteHit>& hits_out) {
+                                       std::vector<RemoteHit>& hits_out,
+                                       int* chain_end_out) {
     // Probe stride aligns to cs; /config is authoritative, local shm is fallback.
     int local_cs = local_ ? local_->tree().register_chunk_size() : 0;
     int cs = cluster_cs_ > 0 ? cluster_cs_ : local_cs;
@@ -564,6 +565,7 @@ int RadixClient::find_component_source(const uint64_t* hashes, int n,
     int my_rank = peer_reg_->my_rank();
     int local_hit = incumbent;
     int best_remote_node = -1;
+    int chain_end = -1;
     std::vector<RemoteHit> remote_hits;
 
     if (local_hit < n) {
@@ -663,7 +665,6 @@ int RadixClient::find_component_source(const uint64_t* hashes, int n,
         }
         // Follow the winner's chain by RHT lengths from its deepest hit: the
         // chain end decides miss-without-walk; the hops become walker hints.
-        int chain_end = -1;
         std::vector<RhtHop> hops;
         if (best_remote_node >= 0) {
             std::unordered_map<uint64_t, FullHit> known;
@@ -724,6 +725,7 @@ int RadixClient::find_component_source(const uint64_t* hashes, int n,
     }
 
     hits_out = std::move(remote_hits);
+    if (chain_end_out) *chain_end_out = best_remote_node >= 0 ? chain_end : -1;
     return best_remote_node;
 }
 
@@ -939,31 +941,55 @@ void RadixClient::dec_ref_remote(int remote_node, const uint64_t* hashes,
 
 #ifndef RADIXSHMEM_NO_RDMA
 
-AllocateReply RadixClient::remote_allocate(int rank, int n) {
+AllocateReply RadixClient::remote_allocate(int rank, int n, ComponentType component) {
     AllocateReply out;
     if (n <= 0) return out;                       // nothing to allocate, status OK
     RemotePeer* p = peer_for(rank);
     if (!p) { out.status = RemoteStatus::BAD_TARGET; return out; }
-    return p->allocate(n);            // serializes + caps internally
+    return p->allocate(n, component);
 }
 
 InsertResult RadixClient::remote_insert(int rank,
                                         const uint64_t* hashes, int n,
                                         int start, int length,
-                                        const int32_t* slots, bool auto_recycle) {
+                                        const int32_t* slots, bool auto_recycle,
+                                        ComponentType component) {
     InsertResult out;
     RemotePeer* p = peer_for(rank);
     if (!p) { out.error = InsertError::REMOTE_FAILED; return out; }
-    return p->insert(hashes, n, start, length, slots, auto_recycle);
+    return p->insert(hashes, n, start, length, slots, auto_recycle, component);
 }
 
-RemoteStatus RadixClient::remote_recycle(int rank, const int32_t* slots, int num_slots) {
+CommitReply RadixClient::remote_commit(int rank, const uint64_t* hashes, int n,
+                                       const std::vector<CommitEntry>& entries) {
+    RemotePeer* p = peer_for(rank);
+    if (!p) {
+        CommitReply out;
+        out.status = RemoteStatus::BAD_TARGET;
+        return out;
+    }
+    return p->commit(hashes, n, entries);
+}
+
+PrepareReply RadixClient::remote_prepare(int rank, const uint64_t* hashes, int n,
+                                         int full_hit, const std::vector<PrepareEntry>& entries) {
+    RemotePeer* p = peer_for(rank);
+    if (!p) {
+        PrepareReply out;
+        out.status = RemoteStatus::BAD_TARGET;
+        return out;
+    }
+    return p->prepare(hashes, n, full_hit, entries);
+}
+
+RemoteStatus RadixClient::remote_recycle(int rank, const int32_t* slots, int num_slots,
+                                         ComponentType component) {
     // slots discriminate RemotePeer::release; null would fall into QUERY_RELEASE.
     if (!slots || num_slots <= 0) return RemoteStatus::BAD_REQUEST;
     RemotePeer* p = peer_for(rank);
     if (!p) return RemoteStatus::BAD_TARGET;
     return p->release(/*hashes=*/nullptr, /*n=*/0, /*start=*/0,
-                      /*length=*/num_slots, slots);
+                      /*length=*/num_slots, slots, component);
 }
 
 QueryResult RadixClient::remote_query(int rank, const uint64_t* hashes, int n,
@@ -996,6 +1022,19 @@ RemoteStatus RadixClient::remote_unlock(int rank, const uint64_t* hashes, int n,
     RemotePeer* p = peer_for(rank);
     if (!p) return RemoteStatus::BAD_TARGET;
     return p->release(hashes, n, 0, hit_length, /*slots=*/nullptr);
+}
+
+// incumbent=0: every probe position counts, so the deepest route wins outright.
+RadixClient::RhtProbeResult RadixClient::rht_probe(const uint64_t* hashes, int n) {
+    RhtProbeResult out;
+    if (!distributed_ || !rht_conn_ || n <= 0 || hashes == nullptr) return out;
+    std::vector<RemoteHit> hits;
+    int chain_end = -1;
+    int best = find_component_source(hashes, n, /*incumbent=*/0, hits, &chain_end);
+    if (best < 0) return out;
+    out.rank = best;
+    out.depth = std::min(std::max(chain_end, 0), n);
+    return out;
 }
 
 #endif  // !RADIXSHMEM_NO_RDMA

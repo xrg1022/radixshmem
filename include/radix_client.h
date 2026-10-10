@@ -47,6 +47,30 @@ struct QueryReply {
     std::vector<int32_t> slots; // target-local physical slot ids (len == hit_length)
 };
 
+struct CommitEntry {
+    ComponentType component;
+    int at; // Exclusive prefix end; FULL starts at at - slots.size().
+    std::vector<int32_t> slots;
+};
+
+struct CommitReply {
+    RemoteStatus status = RemoteStatus::OK;
+    int remote_hit = 0;
+    std::vector<InsertError> errors;
+};
+
+struct PrepareEntry {
+    ComponentType component;
+    int at; // Exclusive prefix end; SWA spans [at - num_slots, at), MAMBA uses one slot.
+    int num_slots;
+};
+
+struct PrepareReply {
+    RemoteStatus status = RemoteStatus::OK;
+    int remote_hit = 0;
+    std::vector<int32_t> full_slots, swa_slots, mamba_slots;
+};
+
 class RemotePeer {
 public:
 #ifdef RADIXSHMEM_HAS_ZMQ
@@ -64,17 +88,27 @@ public:
     RemotePeer(const RemotePeer&) = delete;
     RemotePeer& operator=(const RemotePeer&) = delete;
 
-    AllocateReply allocate(int n);   // pure slot alloc; no hashes, no dedup
+    // pure slot alloc from `component`'s pool; no hashes, no dedup
+    AllocateReply allocate(int n, ComponentType component = ComponentType::FULL);
 
+    // Local insert shape (SWA/MAMBA: start=0); auto_recycle=false leaves redundant/unlanded slots for caller release.
     InsertResult insert(const uint64_t* hashes, int n, int start, int length,
-                        const int32_t* slots, bool auto_recycle = true);
+                        const int32_t* slots, bool auto_recycle = true,
+                        ComponentType component = ComponentType::FULL);
 
     QueryReply query(const uint64_t* hashes, int n, bool lock = false,
                      bool update_meta = true);
 
+    CommitReply commit(const uint64_t* hashes, int n,
+                       const std::vector<CommitEntry>& entries);
+
+    PrepareReply prepare(const uint64_t* hashes, int n, int full_hit,
+                         const std::vector<PrepareEntry>& entries);
+
     // Returns the target's comms status: OK on success, BAD_REQUEST/TIMEOUT/... on failure.
     RemoteStatus release(const uint64_t* hashes, int n, int start, int length,
-                 const int32_t* slots = nullptr);
+                 const int32_t* slots = nullptr,
+                 ComponentType component = ComponentType::FULL);
 
     const std::string& endpoint() const { return endpoint_; }
 
@@ -87,11 +121,12 @@ public:
 private:
 
     RemoteStatus request(const void* req, size_t req_len,
-                         std::vector<char>& reply_out);
+                         std::vector<char>& reply_out, int max_attempts = 0);
 
     RemoteStatus send_ack_op(uint16_t op, const uint64_t* hashes, int n,
                      int start, int length, const int32_t* slots,
-                     uint16_t flags = 0);
+                     uint16_t flags = 0,
+                     ComponentType component = ComponentType::FULL);
 
     std::unique_lock<std::mutex> guard() const {
         return op_mu_ ? std::unique_lock<std::mutex>(*op_mu_)
@@ -206,22 +241,37 @@ public:
     // opens/reuses one cached session per rank internally. An illegal rank yields
     // BAD_TARGET / REMOTE_FAILED in the op result (never throws).
 
-    // Phase 1: allocate `n` slots on the peer (no hashes, no dedup).
-    AllocateReply remote_allocate(int rank, int n);
+    // Phase 1: allocate `n` slots from `component`'s pool on the peer (no hashes, no dedup).
+    AllocateReply remote_allocate(int rank, int n,
+                                  ComponentType component = ComponentType::FULL);
 
     // Phase 2: publish `slots` on the peer; dedup + surplus recycle happen here.
     InsertResult remote_insert(int rank, const uint64_t* hashes, int n,
                                int start, int length, const int32_t* slots,
-                               bool auto_recycle = true);
+                               bool auto_recycle = true,
+                               ComponentType component = ComponentType::FULL);
+
+    // FULL first; errors follow entry order; uncertain transport failure does not authorize recycling.
+    CommitReply remote_commit(int rank, const uint64_t* hashes, int n,
+                              const std::vector<CommitEntry>& entries);
+
+    // Query n hashes, reserve through full_hit, and clip auxiliary grants to the FULL grant end.
+    PrepareReply remote_prepare(int rank, const uint64_t* hashes, int n, int full_hit,
+                                const std::vector<PrepareEntry>& entries);
 
     // Recycle unpublished slots on the peer (abort / auto_recycle=false surplus).
-    RemoteStatus remote_recycle(int rank, const int32_t* slots, int num_slots);
+    RemoteStatus remote_recycle(int rank, const int32_t* slots, int num_slots,
+                                ComponentType component = ComponentType::FULL);
 
     QueryResult remote_query(int rank, const uint64_t* hashes, int n,
                              bool lock = false, bool update_meta = true);
 
     // Drop a remote_query(lock=true) pin: dec_ref over [0, hit_length).
     RemoteStatus remote_unlock(int rank, const uint64_t* hashes, int n, int hit_length);
+
+    // Deepest non-self route, no walk/pin: rank=-1 if absent; depth=min(chain length,n) is advisory.
+    struct RhtProbeResult { int rank = -1; int depth = 0; };
+    RhtProbeResult rht_probe(const uint64_t* hashes, int n);
 #endif
 
     // ==================== Stats / accessors ====================
@@ -293,10 +343,10 @@ private:
     // Cached per-rank session; nullptr on illegal rank (self/oob/negative).
     RemotePeer*  peer_for(int rank);
 
-    // RHT probe from the deepest position not past the incumbent, with the
-    // chunk-gap early-stop; returns best peer rank (-1 = none) plus its hints.
+    // Probe from deepest position <= incumbent; stop at chunk gaps; return peer (-1 if none), hints and chain end.
     int find_component_source(const uint64_t* hashes, int n, int incumbent,
-                              std::vector<RemoteHit>& hits_out);
+                              std::vector<RemoteHit>& hits_out,
+                              int* chain_end_out = nullptr);
     // Authoritative local query/pin + RHT republish, then at most one remote
     // continuation folded as local prefix + remote suffix.
     ComponentQueryResult dist_query_components(const uint64_t* hashes, int n,

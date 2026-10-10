@@ -9,6 +9,7 @@
 
 #include <zmq.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -72,21 +73,22 @@ void ZmqClientTransport::reconnect() {
 
 RemoteStatus ZmqClientTransport::send_request(const void* req, size_t req_len,
                                               uint64_t req_id,
-                                              std::vector<char>& reply_out) {
+                                              std::vector<char>& reply_out, int max_attempts) {
     // The caller has already stamped this request's req_id into the header.
-    for (int attempt = 0; attempt < max_retry_; ++attempt) {
+    const int attempts = max_attempts > 0 ? max_attempts : max_retry_;
+    for (int attempt = 0; attempt < attempts; ++attempt) {
         if (zmq_send(req_sock_, req, req_len, 0) < 0) {
             reconnect();
             continue;
         }
-        char buf[kMaxReplyBytes];
-        int got = zmq_recv(req_sock_, buf, sizeof(buf), 0);
+        reply_out.resize(kMaxReplyBytes);
+        int got = zmq_recv(req_sock_, reply_out.data(), reply_out.size(), 0);
         if (got >= (int)sizeof(RemoteOpReplyHeader)) {
-            auto* h = reinterpret_cast<RemoteOpReplyHeader*>(buf);
+            auto* h = reinterpret_cast<RemoteOpReplyHeader*>(reply_out.data());
             if (h->magic == REMOTE_OP_REPLY_MAGIC &&
                 h->version == REMOTE_OP_PROTOCOL_VERSION &&
                 h->req_id == req_id) {
-                reply_out.assign(buf, buf + got);
+                reply_out.resize((size_t)std::min<int>(got, (int)kMaxReplyBytes));
                 return RemoteStatus::OK;
             }
         }

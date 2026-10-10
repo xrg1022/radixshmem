@@ -14,9 +14,11 @@ namespace radixshmem {
 class IRemoteOpClientTransport {
 public:
     virtual ~IRemoteOpClientTransport() = default;
+    // Positive max_attempts overrides the transport default; zero keeps it.
     virtual RemoteStatus send_request(const void* req, size_t len,
                                       uint64_t req_id,
-                                      std::vector<char>& reply_out) = 0;
+                                      std::vector<char>& reply_out,
+                                      int max_attempts = 0) = 0;
 };
 
 // Reply-routing token from recv_request, handed back to send_reply.

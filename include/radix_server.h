@@ -248,6 +248,10 @@ private:
                                            const uint64_t* hashes);
     std::vector<char> handle_query(const RemoteOpReqHeader& req,
                                    const uint64_t* hashes);
+    std::vector<char> handle_commit(const RemoteOpReqHeader& req,
+                                    const uint64_t* hashes);
+    std::vector<char> handle_prepare(const RemoteOpReqHeader& req,
+                                     const uint64_t* hashes);
 #endif
 };
 

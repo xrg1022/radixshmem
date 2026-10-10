@@ -27,7 +27,7 @@ public:
     ZmqClientTransport& operator=(const ZmqClientTransport&) = delete;
 
     RemoteStatus send_request(const void* req, size_t len, uint64_t req_id,
-                              std::vector<char>& reply_out) override;
+                              std::vector<char>& reply_out, int max_attempts = 0) override;
 
 private:
     void reconnect();    // close + rebuild the wedged REQ socket

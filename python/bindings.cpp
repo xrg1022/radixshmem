@@ -18,6 +18,7 @@
 #endif
 
 #include <optional>
+#include <tuple>
 
 namespace py = pybind11;
 using namespace radixshmem;
@@ -641,18 +642,35 @@ PYBIND11_MODULE(_core, m) {
         }, "Lock-free leak audit; returns the full HealthReport.")
 #ifndef RADIXSHMEM_NO_RDMA
         // Remote ops are rank-first; the client caches one session per rank.
-        .def("remote_allocate", [](RadixClient& c, int rank, int n) {
+        .def("remote_allocate", [](RadixClient& c, int rank, int n,
+                                   ComponentType component) {
             AllocateReply rep;
-            { py::gil_scoped_release rel; rep = c.remote_allocate(rank, n); }
+            { py::gil_scoped_release rel; rep = c.remote_allocate(rank, n, component); }
             return rep;
         }, py::arg("rank"), py::arg("n"),
-           "Phase 1: allocate `n` slots on `rank` (no hashes, no dedup).")
+           py::arg("component") = ComponentType::FULL,
+           "Phase 1: allocate `n` slots from `component`'s pool on `rank` (no hashes, no dedup).")
+
+        .def("remote_prepare", [](RadixClient& c, int rank,
+                                   py::array_t<uint64_t, py::array::c_style | py::array::forcecast> hashes,
+                                   int full_hit,
+                                   const std::vector<std::tuple<ComponentType, int, int>>& entries) {
+            auto [ptr, len] = npy_1d<uint64_t>(hashes, "hashes");
+            std::vector<PrepareEntry> spans;
+            spans.reserve(entries.size());
+            for (const auto& [component, at, num_slots] : entries)
+                spans.push_back({component, at, num_slots});
+            PrepareReply rep;
+            { py::gil_scoped_release rel; rep = c.remote_prepare(rank, ptr, len, full_hit, spans); }
+            return rep;
+        }, py::arg("rank"), py::arg("hashes"), py::arg("full_hit"), py::arg("entries"),
+           "Query the peer and reserve FULL plus clipped aux (component, end, count) spans in one request.")
 
         .def("remote_insert", [](RadixClient& c, int rank,
                                    py::array_t<uint64_t> hashes,
                                    int start, int length,
                                    py::array_t<int32_t> slots,
-                                   bool auto_recycle) {
+                                   bool auto_recycle, ComponentType component) {
             auto [ptr, len] = npy_1d(hashes, "hashes");
             auto [sptr, slen] = npy_1d(slots, "slots");
             if (slen < length)
@@ -660,21 +678,41 @@ PYBIND11_MODULE(_core, m) {
             InsertResult res;
             { py::gil_scoped_release rel;
               res = c.remote_insert(rank, ptr, len, start, length, sptr,
-                                    auto_recycle); }
+                                    auto_recycle, component); }
             return res;
         }, py::arg("rank"), py::arg("hashes"), py::arg("start"),
            py::arg("length"), py::arg("slots"),
-           py::arg("auto_recycle") = true,
-           "Phase 2: publish `slots` on `rank`; auto_recycle frees the unmatched surplus.")
+           py::arg("auto_recycle") = true, py::kw_only(),
+           py::arg("component") = ComponentType::FULL,
+           "Phase 2: publish `slots` on `rank` in `component`'s lane (SWA/MAMBA: start=0, "
+           "same shape rules as insert()); auto_recycle frees the unmatched surplus.")
+
+        .def("remote_commit", [](RadixClient& c, int rank,
+                                  py::array_t<uint64_t, py::array::c_style | py::array::forcecast> hashes,
+                                  const std::vector<std::tuple<ComponentType, int,
+                                      py::array_t<int32_t, py::array::c_style | py::array::forcecast>>>& entries) {
+            auto [ptr, len] = npy_1d<uint64_t>(hashes, "hashes");
+            std::vector<CommitEntry> batch;
+            batch.reserve(entries.size());
+            for (const auto& [component, at, slots] : entries) {
+                auto [sptr, slen] = npy_1d<int32_t>(slots, "slots");
+                batch.push_back({component, at, std::vector<int32_t>(sptr, sptr + slen)});
+            }
+            CommitReply rep;
+            { py::gil_scoped_release rel; rep = c.remote_commit(rank, ptr, len, batch); }
+            return rep;
+        }, py::arg("rank"), py::arg("hashes"), py::arg("entries"),
+           "Publish (component, end, slots) entries in one request, FULL first; unused slots are recycled.")
 
         .def("remote_recycle", [](RadixClient& c, int rank,
-                                  py::array_t<int32_t> slots) {
+                                  py::array_t<int32_t> slots, ComponentType component) {
             auto [sptr, slen] = npy_1d(slots, "slots");
             RemoteStatus st;
-            { py::gil_scoped_release rel; st = c.remote_recycle(rank, sptr, slen); }
+            { py::gil_scoped_release rel; st = c.remote_recycle(rank, sptr, slen, component); }
             return st;
         }, py::arg("rank"), py::arg("slots"),
-           "Return unpublished slots to `rank`'s pool (abort / surplus); returns RemoteStatus.")
+           py::arg("component") = ComponentType::FULL,
+           "Return unpublished slots to `rank`'s `component` pool (abort / surplus); returns RemoteStatus.")
 
         .def("remote_query", [](RadixClient& c, int rank,
                                 py::array_t<uint64_t> hashes, bool lock,
@@ -701,6 +739,16 @@ PYBIND11_MODULE(_core, m) {
             return st;
         }, py::arg("rank"), py::arg("hashes"), py::arg("hit_length"),
            "Manually drop a remote_query(lock=True) pin: dec_ref over [0, hit_length); returns RemoteStatus.")
+
+        .def("rht_probe", [](RadixClient& c, py::array_t<uint64_t> hashes) -> py::object {
+            auto [ptr, len] = npy_1d(hashes, "hashes");
+            RadixClient::RhtProbeResult r;
+            { py::gil_scoped_release rel; r = c.rht_probe(ptr, len); }
+            if (r.rank < 0) return py::none();
+            return py::make_tuple(r.rank, r.depth);
+        }, py::arg("hashes"),
+           "Read-only RHT probe for a push target: (rank, approx_depth) of the peer routing the "
+           "deepest prefix (never this rank), or None. No walk, no pin; depth is advisory.")
 #endif
 
         .def_static("compute_hashes", &py_compute_hashes,
@@ -709,6 +757,24 @@ PYBIND11_MODULE(_core, m) {
 #ifndef RADIXSHMEM_NO_RDMA
     // ==================== Remote-op control plane ====================
     // (RemoteStatus is registered unconditionally in the Enums section above.)
+
+    py::class_<PrepareReply>(m, "PrepareReply")
+        .def_readonly("status", &PrepareReply::status)
+        .def_readonly("remote_hit", &PrepareReply::remote_hit)
+        .def_property_readonly("full_slots", [](const PrepareReply& r) {
+            return vec_to_npy_i32(r.full_slots);
+        })
+        .def_property_readonly("swa_slots", [](const PrepareReply& r) {
+            return vec_to_npy_i32(r.swa_slots);
+        })
+        .def_property_readonly("mamba_slots", [](const PrepareReply& r) {
+            return vec_to_npy_i32(r.mamba_slots);
+        });
+
+    py::class_<CommitReply>(m, "CommitReply")
+        .def_readonly("status", &CommitReply::status)
+        .def_readonly("remote_hit", &CommitReply::remote_hit)
+        .def_readonly("errors", &CommitReply::errors);
 
     py::class_<AllocateReply>(m, "AllocateReply")
         .def_readonly("status", &AllocateReply::status)
