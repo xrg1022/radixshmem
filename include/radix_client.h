@@ -169,6 +169,15 @@ public:
                                bool lock        = false,
                                bool update_meta = true);
 
+    // Best-effort local eviction of hashes[:n]: whole nodes only, deepest first, stops at
+    // a branch or a pin. Blocks freed; -1 without a writable local tree. Push migration.
+    int evict_prefix(const uint64_t* hashes, int n);
+
+    // Local FULL/SWA/checkpoint export; FULL implied, lock pins selected lanes until one-shot finalize().
+    ComponentPathResult path_components(const uint64_t* hashes, int n,
+                           uint32_t mask = COMPONENT_MASK_SWA | COMPONENT_MASK_MAMBA,
+                           bool lock = false);
+
     int allocate_slots(int num_slots, std::vector<int32_t>& out,
                        ComponentType component = ComponentType::FULL);
     void recycle_slots(const int32_t* slots, int num,

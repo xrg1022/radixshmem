@@ -806,6 +806,36 @@ ComponentQueryResult RadixClient::query(const uint64_t* hashes, int n,
     return result;
 }
 
+int RadixClient::evict_prefix(const uint64_t* hashes, int n) {
+    if (!local_ || local_read_only_) return -1;
+    return local_->tree().evict_prefix(hashes, n);
+}
+
+ComponentPathResult RadixClient::path_components(const uint64_t* hashes, int n, uint32_t mask,
+                                    bool lock) {
+    ComponentPathResult out;
+    if ((mask & ~COMPONENT_MASK_ALL) != 0 || n < 0 || (n > 0 && hashes == nullptr) ||
+        !local_) {
+        out.status = RemoteStatus::BAD_REQUEST;
+        return out;
+    }
+    TreeComponentPathResult r = local_->tree().path_components(hashes, n, mask, lock);
+    out.status        = r.status;
+    out.full_hit      = (int)r.full_hit;
+    out.full_slots    = std::move(r.full_slots);
+    out.swa_fragments = std::move(r.swa_fragments);
+    out.checkpoints   = std::move(r.checkpoints);
+    for (auto& f : out.swa_fragments) f.source_rank = (int32_t)rank();
+    if (lock && !r.pin.empty()) {
+        std::vector<uint64_t> hc(hashes, hashes + n);
+        auto* self = this;
+        out.finalize = FinalizeFn([self, hc = std::move(hc), pin = std::move(r.pin)]() {
+            self->dec_ref(hc.data(), (int)hc.size(), pin);
+        });
+    }
+    return out;
+}
+
 #ifndef RADIXSHMEM_NO_RDMA
 
 ComponentQueryResult RadixClient::dist_query_components(

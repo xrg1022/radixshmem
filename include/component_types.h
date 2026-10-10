@@ -30,10 +30,12 @@ struct PinRecord {
     int32_t mamba_end = INVALID_COMPONENT_SLOT;
     int32_t source_rank = -1;
     std::vector<uint64_t> tail;
+    // Sorted pinned checkpoint ENDs for path_components; query pins use mamba_end.
+    std::vector<uint32_t> mamba_ends;
 
     bool empty() const noexcept {
         return full.empty() && swa.empty() &&
-               mamba_end == INVALID_COMPONENT_SLOT;
+               mamba_end == INVALID_COMPONENT_SLOT && mamba_ends.empty();
     }
 };
 
@@ -65,6 +67,32 @@ struct ComponentSlotFragment {
 struct ComponentCheckpoint {
     int32_t source_rank = -1;
     int32_t slot_id = INVALID_COMPONENT_SLOT;
+};
+
+// A Mamba checkpoint at node END end_pos (<= full_hit).
+struct ComponentCheckpointAt {
+    uint32_t end_pos = 0;
+    int32_t slot = INVALID_COMPONENT_SLOT;
+};
+
+// Whole-path export; lock pins FULL/selected SWA spans and listed Mamba checkpoint ENDs.
+struct TreeComponentPathResult {
+    RemoteStatus status = RemoteStatus::OK;
+    uint32_t full_hit = 0;
+    std::vector<int32_t> full_slots;                 // [0, full_hit)
+    std::vector<ComponentSlotFragment> swa_fragments; // sorted disjoint runs; offset = first block
+    std::vector<ComponentCheckpointAt> checkpoints;      // ascending end_pos
+    PinRecord pin;
+};
+
+// lock=true pins are released once via finalize().
+struct ComponentPathResult {
+    RemoteStatus status = RemoteStatus::OK;
+    int full_hit = 0;
+    std::vector<int32_t> full_slots;
+    std::vector<ComponentSlotFragment> swa_fragments;
+    std::vector<ComponentCheckpointAt> checkpoints;
+    FinalizeFn finalize;
 };
 
 // status != OK: no other field is valid. full_fragments tile [0, common_hit)

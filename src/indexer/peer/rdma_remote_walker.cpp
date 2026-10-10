@@ -658,10 +658,8 @@ bool RdmaRemoteWalker::dec_ref_components_remote(const RemoteTreeInfo& remote,
     if (swa_present && (int)pin.swa.end > end) end = (int)pin.swa.end;
     if (mamba_present && (int)pin.mamba_end > end) end = (int)pin.mamba_end;
     if (end <= 0) return false;
-    // Caller keys plus the record's tail must reach the deepest lane END;
-    // the tail holds the terminal's blocks past the caller's keys, whichever
-    // lane pinned that node. The descent below indexes k[matched] for
-    // matched < end, so `end` keys are exactly what it needs.
+    // Caller keys plus the tail must reach the deepest lane END: the descent
+    // below indexes k[matched] for matched < end, so it needs exactly `end` keys.
     const int tail = (int)pin.tail.size();
     if (tail > end) return false;
     const int need = end - tail;

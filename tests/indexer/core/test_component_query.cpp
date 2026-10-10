@@ -1272,6 +1272,17 @@ static void test_remote_pin_incumbent_release() {
     assert(r.walker.dec_ref_components_remote(r.info, ha.data(), 2,
                                               std::move(part.remote_pin)));
     assert(r.ep.faas == 3);
+
+    // The Full tail supplies SWA-cover keys beyond the caller's partial match.
+    r.ep.reset_counters();
+    auto fs_part = r.walker.walk_components(r.info, ha.data(), 2, FS, /*lock=*/true);
+    assert(fs_part.tree.common_hit == 2 && fs_part.remote_pin.full.end == 4 &&
+           fs_part.remote_pin.swa.end == 4 && fs_part.remote_pin.tail.size() == 2);
+    assert(r.ep.faas == 4);
+    r.ep.reset_counters();
+    assert(r.walker.dec_ref_components_remote(r.info, ha.data(), 2,
+                                              std::move(fs_part.remote_pin)));
+    assert(r.ep.faas == 4);
     pressure(t, 8);
     assert(hit(t, ha.data(), 4) == 0);
 

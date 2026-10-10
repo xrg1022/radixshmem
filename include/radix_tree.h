@@ -87,6 +87,10 @@ public:
 
     int try_evict_component_batch(ComponentType component, int target_slots);
 
+    // Evict the nodes of hashes[:n] that lie wholly inside the prefix, deepest first,
+    // stopping at the first node with other children or any ref. Returns blocks freed.
+    int evict_prefix(const uint64_t* hashes, int n);
+
     std::vector<NodeBoundary> get_node_boundaries(const uint64_t* hashes, int n);
 
     // Component-aware peer of query(): mask selects enabled components, lock
@@ -94,6 +98,10 @@ public:
     [[nodiscard]] TreeComponentQueryResult query_components(
         const uint64_t* hashes, int n, uint32_t mask, bool lock = false,
         bool update_meta = true);
+
+    // Whole-path export (FULL implied, absent lanes empty); no LRU touch; lock pins until dec_ref(hashes, n, pin).
+    [[nodiscard]] TreeComponentPathResult path_components(const uint64_t* hashes, int n,
+                                             uint32_t mask, bool lock);
 
     // Positional SWA publish: the slots cover the trailing positions
     // [n - num_slots, n), 1 <= num_slots <= n. The window W only gates queries.
@@ -291,6 +299,11 @@ private:
     void inc_ref(const std::vector<MatchedNodeSpanView>& spans,
                  uint32_t mask, uint32_t common_hit, uint32_t swa_start,
                  uint32_t full_hit, PinRecord& pin);
+
+    // Read lock held; pin FULL/SWA path spans and Mamba at sorted mamba_ends.
+    void inc_ref_path(const std::vector<MatchedNodeSpanView>& spans,
+                      uint32_t mask, uint32_t full_hit,
+                      const std::vector<uint32_t>& mamba_ends, PinRecord& pin);
 
     // Leaf-list move for a Full hit (node timestamps come from query_internal).
     void touch_full(const std::vector<MatchedNodeSpanView>& spans, uint32_t mask,

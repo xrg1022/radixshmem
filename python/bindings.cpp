@@ -289,6 +289,30 @@ PYBIND11_MODULE(_core, m) {
             [](ComponentQueryResult& r) -> FinalizeFn& { return r.finalize; },
             py::return_value_policy::reference_internal);
 
+    py::class_<ComponentPathResult>(m, "ComponentPathResult")
+        .def_readonly("status",   &ComponentPathResult::status)
+        .def_readonly("full_hit", &ComponentPathResult::full_hit)
+        .def_property_readonly("full_slots", [](const ComponentPathResult& r) {
+            return vec_to_npy_i32(r.full_slots);
+        })
+        // SWA runs are sorted and disjoint; offsets are absolute block positions.
+        .def_property_readonly("swa_fragments", [](const ComponentPathResult& r) {
+            py::list runs;
+            for (const auto& run : r.swa_fragments)
+                runs.append(py::make_tuple(run.source_rank, run.offset,
+                                           vec_to_npy_i32(run.slot_ids)));
+            return runs;
+        })
+        .def_property_readonly("checkpoints", [](const ComponentPathResult& r) {
+            py::list cps;
+            for (const auto& c : r.checkpoints)
+                cps.append(py::make_tuple(c.end_pos, c.slot));
+            return cps;
+        })
+        .def_property_readonly("finalize",
+            [](ComponentPathResult& r) -> FinalizeFn& { return r.finalize; },
+            py::return_value_policy::reference_internal);
+
     py::class_<QueryResult>(m, "QueryResult")
         // Request-level transport status (remote_query fills the real one).
         .def_readonly("status",            &QueryResult::status)
@@ -533,6 +557,36 @@ PYBIND11_MODULE(_core, m) {
            py::arg("local_only") = false,
            py::arg("lock") = false, py::arg("update_meta") = true,
            py::keep_alive<0, 1>())
+
+        .def("path_components", [](RadixClient& c, py::array_t<uint64_t> hashes,
+                            py::object mask, bool lock) {
+            if (py::isinstance<ComponentType>(mask))
+                throw py::type_error(
+                    "mask must be a bitwise-OR of COMPONENT_MASK_* constants, "
+                    "not a ComponentType");
+            uint32_t m32 = mask.cast<uint32_t>();
+            auto [ptr, len] = npy_1d(hashes, "hashes");
+            ComponentPathResult result;
+            {
+                py::gil_scoped_release rel;
+                result = c.path_components(ptr, len, m32, lock);
+            }
+            return result;
+        }, py::arg("hashes"),
+           py::arg("mask") = (COMPONENT_MASK_SWA | COMPONENT_MASK_MAMBA),
+           py::arg("lock") = false, py::keep_alive<0, 1>(),
+           "Whole-path export view over the local tree: FULL slots, every live SWA "
+           "fragment and every checkpoint at a node END <= full_hit; lock=True pins "
+           "all of it until finalize().")
+
+        .def("evict_prefix", [](RadixClient& c, py::array_t<uint64_t> hashes) {
+            auto [ptr, len] = npy_1d(hashes, "hashes");
+            int freed;
+            { py::gil_scoped_release rel; freed = c.evict_prefix(ptr, len); }
+            return freed;
+        }, py::arg("hashes"),
+           "Evict the local nodes of hashes that lie wholly inside the prefix, deepest first, "
+           "stopping at a branch or a pinned node; returns blocks freed (-1 without a local tree).")
 
         // Empty array on a component-pool shortfall (all-or-none); bad args raise.
         .def("allocate_slots", [](RadixClient& c, int n,

@@ -1197,19 +1197,21 @@ bool RadixShmemTree::dec_ref(const uint64_t* hashes, int n,
     const bool full_present = pin.full.start < pin.full.end;
     // Lanes this shm does not carry cannot hold a pin: ignore those ranges.
     const bool swa_present = has_swa_ && pin.swa.start < pin.swa.end;
-    const bool mamba_present = has_mamba_ && pin.mamba_end > 0;
+    uint32_t mamba_max = 0;
+    if (has_mamba_) {
+        if (pin.mamba_end > 0) mamba_max = (uint32_t)pin.mamba_end;
+        for (uint32_t e : pin.mamba_ends) mamba_max = std::max(mamba_max, e);
+    }
+    const bool mamba_present = mamba_max > 0;
     if (!full_present && !swa_present && !mamba_present)
         return true;   // empty record: release is a no-op
 
-    // Legacy trust model: re-walk by the caller's hashes and
-    // decrement unconditionally inside the recorded lane ranges. The walk
-    // must reach the deepest lane END; the record's tail supplies the
-    // terminal's blocks past the caller's keys, whichever lane pinned it.
+    // Legacy trust model: re-walk the caller's hashes to the deepest
+    // lane END; the tail supplies the terminal's blocks past the caller's keys.
     uint32_t end = 0;
     if (full_present) end = pin.full.end;
     if (swa_present && pin.swa.end > end) end = pin.swa.end;
-    if (mamba_present && (uint32_t)pin.mamba_end > end)
-        end = (uint32_t)pin.mamba_end;
+    if (mamba_present && mamba_max > end) end = mamba_max;
     const uint32_t tail = (uint32_t)pin.tail.size();
     if (tail > end) return false;
     const uint32_t need = end - tail;   // caller keys the prefix [0, need)
@@ -1222,6 +1224,11 @@ bool RadixShmemTree::dec_ref(const uint64_t* hashes, int n,
         keys.insert(keys.end(), pin.tail.begin(), pin.tail.end());
         k = keys.data();                // exactly `end` keys
     }
+    auto mamba_at = [&](uint32_t e) {
+        return (pin.mamba_end > 0 && e == (uint32_t)pin.mamba_end) ||
+               std::find(pin.mamba_ends.begin(), pin.mamba_ends.end(), e) !=
+                   pin.mamba_ends.end();
+    };
 
     read_lock();
     QueryInternalDetail m = query_internal(k, (int)end, 0, false);
@@ -1233,11 +1240,93 @@ bool RadixShmemTree::dec_ref(const uint64_t* hashes, int n,
             (void)dec_ref(nodes_.get(v.node_id)->ref_count);
         if (swa_present && s >= pin.swa.start && s < pin.swa.end)
             (void)dec_ref(nodes_.component_state(v.node_id)->swa_ref_count);
-        if (mamba_present && e == (uint32_t)pin.mamba_end)
+        if (mamba_present && mamba_at(e))
             (void)dec_ref(nodes_.component_state(v.node_id)->mamba_ref_count);
     }
     read_unlock();
     return true;
+}
+
+TreeComponentPathResult RadixShmemTree::path_components(const uint64_t* hashes, int n,
+                                         uint32_t mask, bool lock) {
+    const ComponentConfig& config = header()->component_config;
+    TreeComponentPathResult r;
+    if ((mask & ~COMPONENT_MASK_ALL) != 0 ||
+        !is_component_config_valid(config.component_mask,
+                                   config.swa_window_blocks) ||
+        n < 0 || (n > 0 && hashes == nullptr)) {
+        r.status = RemoteStatus::BAD_REQUEST;
+        return r;
+    }
+    if (n == 0) return r;
+    const bool want_swa = has_swa_ && (mask & COMPONENT_MASK_SWA) != 0;
+    const bool want_mamba = has_mamba_ && (mask & COMPONENT_MASK_MAMBA) != 0;
+
+    read_lock();
+    QueryInternalDetail m = query_internal(hashes, n, 0, false);
+    std::vector<MatchedNodeSpanView> spans = path_spans(m);
+    r.full_hit = (uint32_t)m.matched_blocks;
+    r.full_slots.reserve(r.full_hit);
+    std::vector<uint32_t> mamba_ends;
+    ComponentSlotFragment frag;
+    for (const MatchedNodeSpanView& v : spans) {
+        r.full_slots.insert(r.full_slots.end(), v.full_slots,
+                            v.full_slots + v.matched_blocks);
+        if (want_swa) {
+            for (uint32_t i = 0; i < v.matched_blocks; i++) {
+                const int32_t cell = v.swa_slots[i];
+                if (cell == INVALID_COMPONENT_SLOT) {
+                    if (!frag.slot_ids.empty()) {
+                        r.swa_fragments.push_back(std::move(frag));
+                        frag = ComponentSlotFragment{};
+                    }
+                    continue;
+                }
+                if (frag.slot_ids.empty()) frag.offset = (int)(v.absolute_start + i);
+                frag.slot_ids.push_back(cell);
+            }
+        }
+        const uint32_t end = v.absolute_start + v.node_blocks;
+        if (want_mamba && end <= r.full_hit &&
+            v.mamba_checkpoint_slot != INVALID_COMPONENT_SLOT) {
+            r.checkpoints.push_back({end, v.mamba_checkpoint_slot});
+            mamba_ends.push_back(end);
+        }
+    }
+    if (!frag.slot_ids.empty()) r.swa_fragments.push_back(std::move(frag));
+    if (lock && r.full_hit > 0)
+        inc_ref_path(spans, mask, r.full_hit, mamba_ends, r.pin);
+    read_unlock();
+    return r;
+}
+
+// Pin every SWA span to balance concurrent publishes; Mamba pins track split-invariant ENDs.
+void RadixShmemTree::inc_ref_path(const std::vector<MatchedNodeSpanView>& spans,
+                                uint32_t mask, uint32_t full_hit,
+                                const std::vector<uint32_t>& mamba_ends,
+                                PinRecord& pin) {
+    PinCoverage cov = compute_pin_coverage(spans.data(), spans.size(),
+                                           COMPONENT_MASK_FULL, 0, 0, 0,
+                                           full_hit);
+    if (!cov.has_full) return;
+    record_pin_tail(spans.data(), spans.size(), cov, full_hit, full_hit, pin);
+    const bool pin_swa = has_swa_ && (mask & COMPONENT_MASK_SWA) != 0;
+    const bool pin_mamba = has_mamba_ && (mask & COMPONENT_MASK_MAMBA) != 0 &&
+                           !mamba_ends.empty();
+    if (pin_swa) pin.swa = pin.full;
+    if (pin_mamba) pin.mamba_ends = mamba_ends;
+    for (size_t i = cov.full_from; i <= cov.full_k; i++) {
+        const uint32_t id = spans[i].node_id;
+        nodes_.get(id)->ref_count.fetch_add(1, std::memory_order_relaxed);
+        if (pin_swa)
+            nodes_.component_state(id)->swa_ref_count.fetch_add(
+                1, std::memory_order_relaxed);
+        if (pin_mamba &&
+            std::binary_search(mamba_ends.begin(), mamba_ends.end(),
+                               spans[i].absolute_start + spans[i].node_blocks))
+            nodes_.component_state(id)->mamba_ref_count.fetch_add(
+                1, std::memory_order_relaxed);
+    }
 }
 
 QueryInternalDetail RadixShmemTree::query_internal(const uint64_t* hashes, int n,
@@ -1709,6 +1798,25 @@ int RadixShmemTree::try_evict_batch(int target_blocks) {
     set_write_op("evict_bg");
     if (!try_write_lock()) return 0;
     int freed = evict_walk(target_blocks);
+    write_unlock();
+    flush_evicted();
+    return freed;
+}
+
+int RadixShmemTree::evict_prefix(const uint64_t* hashes, int n) {
+    set_write_op("evict_prefix");
+    if (n <= 0 || hashes == nullptr) return 0;
+    write_lock();
+    auto spans = path_spans(query_internal(hashes, n, 0, /*touch=*/false));
+    int freed = 0;
+    std::vector<int32_t> tmp;
+    for (auto it = spans.rbegin(); it != spans.rend(); ++it) {   // leaf first: a child frees its parent
+        const auto& v = *it;
+        if (v.matched_blocks != v.node_blocks ||
+            nodes_.get(v.node_id)->children_count != 0 || !component_refs_zero(v.node_id))
+            break;
+        freed += evict_node(v.node_id, tmp);
+    }
     write_unlock();
     flush_evicted();
     return freed;
