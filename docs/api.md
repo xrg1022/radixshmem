@@ -28,6 +28,7 @@ This document is for users who call RadixShmem directly (C++ or Python). It cent
     - `[remote_recycle](#remote_recycle)`
     - `[remote_query](#remote_query)`
     - `[remote_unlock](#remote_unlock)`
+    - `[rht_probe](#rht_probe)`
   - [3.3 Slot management](#33-slot-management)
     - `[reset](#reset)`
   - [3.4 Reference release](#34-reference-release)
@@ -508,18 +509,20 @@ client.insert(hashes, n, m.data(), 1,
 ### `remote_allocate`
 
 ```cpp
-AllocateReply remote_allocate(int rank, int n);
+AllocateReply remote_allocate(int rank, int n,
+                              ComponentType component = ComponentType::FULL);
 ```
 
-**Phase 1** of the two-phase remote write: asks the peer to allocate `n` slots from **its own** mempool as a pure allocation (**no hashes, no server-side dedup, tree unchanged, nothing published, no pin**), and returns the target-local slot ids (so the caller can move KV there). Deduplication has moved to phase-2 `remote_insert` (the local insert only consumes the missed tail segment and the surplus is reclaimed automatically).
+**Phase 1** of the two-phase remote write: asks the peer to allocate `n` slots from **its own** `component` pool as a pure allocation (**no hashes, no server-side dedup, tree unchanged, nothing published, no pin**), and returns the target-local slot ids (so the caller can move KV there). Deduplication has moved to phase-2 `remote_insert` (the local insert only consumes the missed tail segment and the surplus is reclaimed automatically).
 
 #### Parameters
 
 
-| Parameter | Type    | Meaning                                          |
-| ------ | ----- | ------------------------------------------- |
-| `rank` | `int` | Target peer (invalid → `status = BAD_TARGET`).        |
-| `n`    | `int` | Number of slots to allocate, **≤ 512** (over the limit returns `BAD_REQUEST`; not split). |
+| Parameter   | Type            | Meaning                                          |
+| ----------- | --------------- | ------------------------------------------- |
+| `rank`      | `int`           | Target peer (invalid → `status = BAD_TARGET`).        |
+| `n`         | `int`           | Number of slots to allocate, **≤ `MAX_REMOTE_OP_BLOCKS` (8192)** (over the limit returns `BAD_REQUEST`; not split). |
+| `component` | `ComponentType` | Pool to allocate from (default FULL). FULL is best effort: when the target is still short after eviction it returns what it could allocate (possibly < `n`) and the caller truncates to that. The SWA / MAMBA pools allocate all or nothing: `slots` is empty when they cannot supply `n`. An invalid value is rejected by the target (`BAD_REQUEST`). |
 
 
 
@@ -530,7 +533,7 @@ AllocateReply remote_allocate(int rank, int n);
 | Field       | Type                              | Meaning                                                                                                  |
 | -------- | ------------------------------- | --------------------------------------------------------------------------------------------------- |
 | `status` | `[RemoteStatus](#remotestatus)` | **Check first**; when not `OK`, `slots` is empty.                                                                          |
-| `slots`  | `std::vector<int32_t>`          | **Target-local** physical slot ids (not addressable from this process; for use by the KV transfer channel), length == `n`. The allocated slots are not bound to any prefix and the evictor cannot touch them; the server is stateless, so **abandoned slots must be returned with** `remote_recycle`. |
+| `slots`  | `std::vector<int32_t>`          | **Target-local** physical slot ids (not addressable from this process; for use by the KV transfer channel); length ≤ `n` for FULL, == `n` or 0 for SWA / MAMBA. The allocated slots are not bound to any prefix and the evictor cannot touch them; the server is stateless, so **abandoned slots must be returned with** `remote_recycle`. |
 
 
 ---
@@ -542,7 +545,8 @@ AllocateReply remote_allocate(int rank, int n);
 ```cpp
 InsertResult remote_insert(int rank, const uint64_t* hashes, int n,
                            int start, int length, const int32_t* slots,
-                           bool auto_recycle = true);
+                           bool auto_recycle = true,
+                           ComponentType component = ComponentType::FULL);
 ```
 
 **Phase 2** of the two-phase remote write: the target runs a real `insert(hashes, slots)` with the phase-1 slots carried in the request, publishing into its tree + RHT (hits are possible immediately after publishing). **Deduplication happens here**: prefixes that the local insert already hits do not consume slots; by default (`auto_recycle=true`) the target reclaims surplus slots in place, and with `auto_recycle=false` they stay allocated and the caller reclaims them explicitly with `remote_recycle`. A new prefix typically passes `start=0, length=n`.
@@ -553,10 +557,11 @@ InsertResult remote_insert(int rank, const uint64_t* hashes, int n,
 | Parameter                    | Type                       | Meaning                                                                                    |
 | --------------------- | ------------------------ | ------------------------------------------------------------------------------------- |
 | `rank`                | `int`                    | Target peer (invalid → `error = REMOTE_FAILED`).                                                 |
-| `hashes` / `n`        | `const uint64_t*` / `int`| Cumulative prefix hash array (the server is stateless and re-walks the path from it), `n ≤ 512`.                                                    |
+| `hashes` / `n`        | `const uint64_t*` / `int`| Cumulative prefix hash array (the server is stateless and re-walks the path from it), `n ≤ MAX_REMOTE_OP_BLOCKS` (8192).                             |
 | `start` / `length`    | `int`                    | Publish range; a new prefix uses `start=0, length=n`. The request carries `length` entries of `slots` (slots follow the hashes).                       |
 | `slots`               | `const int32_t*`         | The slots returned by phase-1 `remote_allocate`.                                                   |
 | `auto_recycle`        | `bool`                   | `true`: the target reclaims the dedup surplus in place; `false`: the surplus stays allocated and the caller reclaims it explicitly with `remote_recycle`.                             |
+| `component`           | `ComponentType`          | Lane to publish into (default FULL). SWA / MAMBA follow the local `insert`: `start = 0`, `hashes` is the whole prefix `[0, n)`, the `length` SWA slots cover the tail `[n - length, n)`, MAMBA has `length = 1`. When the target lacks the FULL path `[0, n)` the result is `FULL_PATH_MISSING` and the slots are reclaimed according to `auto_recycle`. |
 
 
 
@@ -572,10 +577,11 @@ Same `InsertResult` (`{error, unused_slots}`) as local `[insert](#insert)`: `unu
 ### `remote_recycle`
 
 ```cpp
-RemoteStatus remote_recycle(int rank, const int32_t* slots, int num_slots);
+RemoteStatus remote_recycle(int rank, const int32_t* slots, int num_slots,
+                            ComponentType component = ComponentType::FULL);
 ```
 
-Returns slots obtained from `remote_allocate` but **not published** to the target mempool (when the whole operation is aborted, or the surplus under `auto_recycle=false`). The target only runs `recycle_slots` and does not touch the tree.
+Returns slots obtained from `remote_allocate` but **not published** to the target's `component` pool (when the whole operation is aborted, or the surplus under `auto_recycle=false`). The target only runs `recycle_slots` and does not touch the tree.
 
 #### Parameters
 
@@ -584,6 +590,7 @@ Returns slots obtained from `remote_allocate` but **not published** to the targe
 | --------------------- | ------------------------ | --------------------------------------------- |
 | `rank`                | `int`                    | Target peer (invalid → `BAD_TARGET`).                   |
 | `slots` / `num_slots` | `const int32_t*` / `int` | Slots to return and their count (null pointer / `0` → `BAD_REQUEST`).     |
+| `component`           | `ComponentType`          | Pool to return to (default FULL); must match the allocation.             |
 
 
 
@@ -611,7 +618,7 @@ Remote-operation query (1 RTT): the peer queries **its own** local tree (this me
 | Parameter             | Type     | Meaning                                                                                       |
 | -------------- | ------ | ---------------------------------------------------------------------------------------- |
 | `rank`         | `int`  | Target peer (invalid → `status = BAD_TARGET`).                                                     |
-| `hashes` / `n` | —      | Cumulative prefix hash array, `n ≤ 512`.                                                                       |
+| `hashes` / `n` | —      | Cumulative prefix hash array, `n ≤ MAX_REMOTE_OP_BLOCKS` (8192).                                               |
 | `lock`         | `bool` | When `true`, the target pins the hit prefix `[0, hit_length)` with inc_ref (it must be released after reading: `result.finalize()` or `remote_unlock`). |
 | `update_meta`  | `bool` | When `false`, the target's LRU metadata is not modified.                                                                    |
 
@@ -663,6 +670,28 @@ Releases the pin from `remote_query(lock=true)`: the target runs dec_ref on `[0,
 `[RemoteStatus](#remotestatus)` — `OK` means the target has released the pin. **A failure must not be retried with a new call** (dec_ref is not idempotent).
 
 > **The automatic cross-node walk is now part of** `[query](#query)`: when `query(hashes, n, COMPONENT_MASK_FULL, /*local_only=*/false)` finds too little locally, it routes through the RHT and continues the lookup on at most one peer with one-sided RDMA reads (the target CPU does not participate). Use `rdma_read_count > 0` in the return value to tell whether a remote read was issued; there is no longer a separate `remote_walk` entry point.
+
+---
+
+
+
+### `rht_probe`
+
+```cpp
+struct RhtProbeResult { int rank = -1; int depth = 0; };
+RhtProbeResult rht_probe(const uint64_t* hashes, int n);
+```
+
+The target-selection primitive of push: a read-only RHT probe. It probes the routes of `hashes` at the local tree's node boundaries and the cs-aligned positions and picks the peer whose route chain covers the deepest prefix (this rank's own routes are skipped). It does not walk the peer tree, takes no pin and sends no remote op. The cluster query's `pos + num_blocks > incumbent` filter does not apply here: the pusher holds the whole prefix locally and that rule would never yield a target, so the probe starts from incumbent = 0.
+
+#### Return value
+
+| Field   | Meaning                                                                                      |
+| ------- | -------------------------------------------------------------------------------------------- |
+| `rank`  | Candidate peer; `-1` when there is none (not a cluster, `local_read_only`, `n <= 0`, no route in the RHT). |
+| `depth` | Published length of the candidate's route chain, capped at `n`. An approximation: routes are soft state and the peer may have evicted or extended since; the caller verifies with `remote_query`. 0 when `rank == -1`. |
+
+> With the default `rht_slots_per_bucket = 1` the last writer of a key wins: when both the pusher and the target have published the node holding `hashes[0]`, they overwrite each other's route. Deployments that pick the target automatically (`push_async(rank=None)`) should use W ≥ 2.
 
 ---
 
@@ -748,7 +777,7 @@ Clears all caches of this client in place: resets this node's radix tree to empt
 
 ### 3.4 Reference release
 
-A pin can only be created by `[query](#query)` with `lock=true`, and can only be released through the one-shot `finalize()` in the return value. `finalize()` uses the per-lane coverage recorded at creation time (internal `PinRecord`, not exposed), re-walks the local tree and the pinned peer tree with the same `hashes`, and decrements references; it tolerates node splits that happened in between. `RadixClient` does not provide `inc_ref` / `dec_ref` / `dec_ref_remote`; C++ and Python are the same here.
+A pin is created by `[query](#query)` or `path_components` with `lock=true`, and can only be released through the one-shot `finalize()` in the return value. `path_components(hashes, n, mask, lock)` is the local whole-path export (the source side of push): it returns the FULL slots of `[0, full_hit)`, every live SWA run inside it (`ComponentSlotFragment{source_rank, offset, slot_ids}`, run end = offset + slot_ids.size()) and every checkpoint with END ≤ full_hit (`{end_pos, slot}`); with `lock=true` the FULL ref and swa_ref are taken on every path node and the mamba_ref on every node whose checkpoint is exported, and one `finalize()` releases them all. `finalize()` uses the per-lane coverage recorded at creation time (internal `PinRecord`, not exposed), re-walks the local tree and the pinned peer tree with the same `hashes`, and decrements references; it tolerates node splits that happened in between. `RadixClient` does not provide `inc_ref` / `dec_ref` / `dec_ref_remote`; C++ and Python are the same here.
 
 - `finalize()` is idempotent: repeated calls are no-ops; `bool(finalize)` is `true` when there is still an unreleased pin.
 - The pin lasts as long as the `ComponentQueryResult` (or the moved-out `finalize`) is held; dropping the handle without calling it does **not** release the pin, and the nodes stay non-evictable.
@@ -984,7 +1013,7 @@ enum class ComponentType : uint32_t { FULL = 0, SWA = 1, MAMBA = 2 };  // Identi
 
 ## 5. Python binding differences
 
-The public surface of the Python package is two pure-Python classes: `radixshmem.RadixServer` (one process per node, holding the index, SlotStore, transfer engine, and gRPC service; started with the operator parameters `ServerConfig`, it starts in `waiting`, and the geometry is sent by a client) and `radixshmem.RadixClient` (can be constructed before the server is ready; `RadixClient(name, Geometry)` also hands the geometry to the server; `status()` / `configure()` do not block, `wait_ready()` blocks; the index and SlotStore are attached on the first index / data call, raising `ServerNotReady` if not ready; index operations pass through to the underlying `_core.RadixClient`, plus `pull_async()`: query, hand the transfer to the server, publish locally on completion, and `PullJob.wait()` returns local slots). The classes aligned with C++ described below live in the pybind modules `radixshmem._core` (index surface) and `radixshmem._data` (SlotStore / transfer surface), for tests and advanced users to use directly.
+The public surface of the Python package is two pure-Python classes: `radixshmem.RadixServer` (one process per node, holding the index, SlotStore, transfer engine, and gRPC service; started with the operator parameters `ServerConfig`, it starts in `waiting`, and the geometry is sent by a client) and `radixshmem.RadixClient` (can be constructed before the server is ready; `RadixClient(name, Geometry)` also hands the geometry to the server; `status()` / `configure()` do not block, `wait_ready()` blocks; the index and SlotStore are attached on the first index / data call, raising `ServerNotReady` if not ready; index operations pass through to the underlying `_core.RadixClient`, plus `pull_async()`: query, hand the transfer to the server, publish locally on completion, and `PullJob.wait()` returns local slots; and `push_async()`, its reverse: write a prefix this node holds into a peer's SlotStore and publish it there, see below). The classes aligned with C++ described below live in the pybind modules `radixshmem._core` (index surface) and `radixshmem._data` (SlotStore / transfer surface), for tests and advanced users to use directly.
 
 `radixshmem._core` matches the C++ API names and signatures nearly one to one. Differences:
 
@@ -1001,13 +1030,28 @@ The public surface of the Python package is two pure-Python classes: `radixshmem
 **Remote operations ([§3.2](#32-datapath-insert--query--remote-ops)) are all exported to Python** (only when a remote-op backend is compiled in), with signatures matching C++:
 
 - **Always rank-first, no handles**: the client opens and caches sessions per rank internally and lazily. The normal automatic cross-node walk goes through `client.query(hashes, mask=radixshmem.COMPONENT_MASK_FULL, local_only=False)`; when the one-sided RDMA continuation fails, the local incumbent is kept (observer returns an empty hit).
-- `client.remote_allocate(rank, n) → AllocateReply` (phase 1, allocation only)
-- `client.remote_insert(rank, hashes, start, length, slots, auto_recycle=True) → InsertResult` (phase 2, publish + dedup)
-- `client.remote_recycle(rank, slots) → RemoteStatus` (return unpublished allocations)
+- `client.rht_probe(hashes) → (rank, approx_depth) | None` (read-only RHT target selection for push: the peer whose route chain covers the deepest prefix of `hashes`, excluding this rank, no walk, no pin; routes are soft state, so verify with `remote_query` after `push_async`; `None` outside a cluster / for `local_read_only`. With the default `rht_slots_per_bucket=1` the last writer of a key wins, so a pusher and a target that both published `hashes[0]` overwrite each other's route; deployments that pick the target automatically should use W ≥ 2)
+- `client.evict_prefix(hashes) → int` (local whole-prefix eviction: from the deepest node on the matched path upwards, evicts only nodes that lie entirely inside the prefix, have no other children and no reference, and stops at a fork / a pin / a half-covered terminal node; returns the number of blocks freed, -1 without a writable local tree; the SWA cells and checkpoints of a node retire with it and the RHT routes are cleared by the eviction callback; this is the source-side step of `push_async(evict_local=True)`)
+- `client.path_components(hashes, mask=COMPONENT_MASK_SWA | COMPONENT_MASK_MAMBA, lock=False) → ComponentPathResult` (local whole-path export: `full_hit` / `full_slots` / `swa_fragments`=[(source_rank, offset, slots)] / `checkpoints`=[(end, slot)]; with `lock=True` one `finalize` releases the pins of the whole path)
+- `client.remote_allocate(rank, n, component=ComponentType.FULL) → AllocateReply` (phase 1, allocation only)
+- `client.remote_insert(rank, hashes, start, length, slots, auto_recycle=True, *, component=ComponentType.FULL) → InsertResult` (phase 2, publish + dedup)
+- `client.remote_recycle(rank, slots, component=ComponentType.FULL) → RemoteStatus` (return unpublished allocations)
+- The remote-op request header carries `component` since wire protocol v7; the current version is v10. A version mismatch makes the target answer `BAD_REQUEST` and the initiator's transport drop the reply, which shows as `TIMEOUT`: both ends must be upgraded together.
 - `client.remote_query(rank, hashes, lock=False, update_meta=True) → QueryResult` (remote operation, 1 RTT)
 - `client.remote_unlock(rank, hashes, hit_length) → RemoteStatus` (release the pin from `lock=True`)
 - New types exposed readonly: `AllocateReply` (`status`/`slots`); enum `radixshmem.RemoteStatus` (7 values). `RemotePeer` is no longer in Python (sessions are managed inside the client).
 - The `finalize` closure of `remote_query(lock=True)` carries `keep_alive`: it keeps the parent `RadixClient` from being GC'd (the reply DCT of a dc session is attached to its process-level receive target).
+
+**`push_async` (Python)**: `client.push_async(hashes, mask=COMPONENT_MASK_FULL, *, rank=None, evict_local=False, timeout_ms=30000, block=True) → PushJob` is the reverse of `pull_async`: it WRITEs the suffix of `hashes` that `rank` lacks into that peer's SlotStore and publishes it into the peer's tree with one `remote_commit`. The job is returned at once; `PushJob.wait()` / `client.wait(job_or_id)` / `client.wait_any(jobs)` take push jobs as well as pull jobs; a `PushJob` has no `cancel`.
+
+- `rank=None` (default) picks the target with `rht_probe`; without a candidate the job completes at once with `committed=0`, `target_rank=-1`. An explicit `rank` equal to this node raises `ValueError`.
+- Only the first `MAX_REMOTE_OP_BLOCKS` hashes are pushed (the wire limit). The FULL bit of `mask` always applies; with SWA / MAMBA in `mask`, every SWA run and checkpoint on the local path `[0, end)` travels along, including the part the target already holds (the target deduplicates, first writer wins). FULL, all SWA runs and the checkpoints are published in one `remote_commit`, FULL first, then the aux lanes.
+- One `remote_prepare` combines the target's hit query with the allocation of every lane. FULL is truncated to the slots actually granted (a short target pool takes what fits; counted in `push_staging_shortfalls`); every aux lane is allocated all-or-nothing on the target, and a lane the target pool cannot hold is skipped as a whole (also `push_staging_shortfalls`).
+- The push copies by default and leaves the local blocks to the LRU. `evict_local=True` migrates: once the peer holds `[0, committed)` the same range is `evict_prefix`ed locally (only an exclusively held leaf path is actually freed; nothing is evicted when any lane the local path holds did not land on the peer, whether `mask` left it out, the peer pool was short or the commit failed). `PushResult.local_evicted` is the number of blocks freed.
+- `PushJob.remote_hit` / `planned_push` are known on return: the blocks the target already had and the blocks planned for transfer. `PushResult`: `committed` (prefix length the target holds at the end; 0 when the FULL publication failed or the final hit fell short), `remote_blocks` / `remote_bytes` (what crossed the wire), `target_rank`, `local_evicted`.
+- Counters on the client: `pull_transfer_failures` / `pull_staging_shortfalls` / `pull_promotion_shortfalls` (pull side: failed transfers; local staging slots not available; the re-query after publishing hit less than the first query; all degrade to the local hit, the job completes, nothing raises) and `push_transfer_failures` / `push_staging_shortfalls` / `push_commit_shortfalls` (push side: failed transfers; short target grants; FULL or an aux run that failed to land in the commit, for example because the target prefix was evicted in the window; the target reclaims that staging). `saturated` counts `block=False` calls that found all `max_outstanding` slots busy; pull and push share the semaphore and the counter.
+
+Flow: after choosing the target, `push_async` exports and pins the local FULL path and the selected aux lanes with `path_components(lock=True)`, then calls `remote_prepare(rank, hashes, full_hit, entries)` once, `entries` being the `(component, end, count)` of the SWA runs and checkpoints. The target queries its FULL hit `hr` for the hashes and allocates FULL staging only for `[hr, full_hit)`; FULL may be granted partially, so the real end is `end = hr + len(full_slots)`. The target clips the SWA runs and checkpoints to `end` and allocates each aux lane all-or-nothing; no aux lane is allocated when FULL has no increment or received no slots. It returns `hr` and the slot arrays per lane, from which the client builds the WRITE items; when prepare fails or nothing needs to move, the local pin is released. The server WRITEs over RDMA (one ticket, one item per lane) and, once the transfer landed, the completer publishes FULL `[hr, end)` plus every SWA run and checkpoint whose WRITE succeeded in one `remote_commit`; the target inserts FULL first and then the aux runs, reclaims duplicate or unlanded staging itself, and returns per-entry errors and its final FULL hit. This is a batch publication, not an atomic transaction: when the FULL publication fails or the planned prefix is missing, the target skips and reclaims the aux entries of the batch. Runs the target already holds are pushed anyway and deduplicated first-writer-wins; the target prefix is never pinned. `committed=0` when the final FULL hit falls short or an aux entry returns `FULL_PATH_MISSING`; `push_commit_shortfalls` counts once when FULL did not land, otherwise once per failed aux run. Lanes whose WRITE failed are returned with `remote_recycle`; an uncertain commit reply is not resent, and the client neither reclaims slots handed to the commit nor migrates the local copy. Neither prepare nor commit is retried automatically; a lost prepare reply can leave reserved slots the client never learns about (no lease or background reclamation yet). A push that moves data costs two cross-node control-plane RPCs (`prepare → WRITE → commit`), not counting the data plane and the local Submit / WaitAny. `remote_allocate`, `remote_insert` and `remote_query` stay available; historical SWA runs are still not deduplicated.
 
 **Plain query (Python)**: `client.query(...)` is the only entry point, and `mask` defaults to `COMPONENT_MASK_FULL`: `client.query(hashes, mask=radixshmem.COMPONENT_MASK_FULL | radixshmem.COMPONENT_MASK_SWA, local_only=False, lock=False, update_meta=True)`. Key points:
 

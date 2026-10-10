@@ -66,7 +66,7 @@ radix-server --name /my_kv_cache --data-bytes 1024G --mamba-ratio 0.2 \
 
 ### Client API
 
-A client connects to the local server by name and provides `query`, `pull_async`, and `insert`.
+A client connects to the local server by name and provides `query`, `pull_async`, `insert`, and `push_async`.
 
 1. **Initialize.** Construct the client with the server name and a `Geometry` (tokens per block and bytes per
    slot), then wait until the server is ready.
@@ -112,6 +112,19 @@ for i, slot in enumerate(slots):
     dst.copy_(gpu_blocks[matched + i])  # gpu_blocks[k]: KV of block k as a flat uint8 tensor
 client.insert(hashes, slots, start=matched)
 ```
+
+5. **Push.** `push_async()` is the reverse of `pull_async()`: it writes a prefix this node holds into a peer's
+   SlotStore (the server runs the RDMA WRITEs) and publishes it in the peer's index. With `rank=None` the RHT
+   picks the peer; with `evict_local=True` the local copy is dropped once the peer holds it. It needs
+   `--enable-remote-insert` and `--enable-remote-query` on the servers.
+
+```python
+r = client.push_async(hashes).wait()   # [0, r.committed) is now on rank r.target_rank
+```
+
+`python tests/agentic_stress.py --nodes 4 --push --block-size 128 --turns 3,6` exercises it (data mode, more
+than one node); a turn longer than `MAX_REMOTE_OP_BLOCKS` hashes is not pushed and is counted as
+`push.capped`, so keep the sessions under the cap with `--block-size` / `--turns`.
 
 The full API (methods, parameters, result fields, error codes) is in [`docs/api.md`](docs/api.md).
 
