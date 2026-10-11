@@ -238,7 +238,7 @@ class RadixServer:
         self._greg: Optional[_GeometryRegistry] = None
         self._rejected: Optional[Dict[str, Any]] = None   # cluster geometry this node could not take
         self._peers: Dict[int, str] = {}
-        self._zombies: List[int] = []
+        self._zombies: List[tuple] = []  # (job, item, handle, original reply) awaiting drain
         self._rpc = None
         self._stop = threading.Event()
         self._poller: Optional[threading.Thread] = None
@@ -680,12 +680,15 @@ class RadixServer:
                     continue
                 if st == _data.XferState.PENDING:
                     st = _data.XferState.TIMEOUT
-                if self._xfer.release(h) == _data.XFER_EBUSY:
-                    self._zombies.append(h)
                 ok = st == _data.XferState.COMPLETED
                 if not ok:
                     self._peers.pop(job.items[i][0], None)
-                self._resolve(job, i, (ok, int(done), int(nd), "" if ok else str(st)))
+                reply = (ok, int(done), int(nd), "" if ok else str(st))
+                if self._xfer.release(h) == _data.XFER_EBUSY:
+                    # Drain DMA before completion lets the client release slots.
+                    self._zombies.append((job, i, h, reply))
+                else:
+                    self._resolve(job, i, reply)
                 progressed = True
             inflight = still
             if now - last_gc > 1.0:
@@ -726,4 +729,9 @@ class RadixServer:
         from radixshmem import _data
 
         if self._xfer is not None:
-            self._zombies = [h for h in self._zombies if self._xfer.release(h) == _data.XFER_EBUSY]
+            zombies, self._zombies = self._zombies, []
+            for job, i, h, reply in zombies:
+                if self._xfer.release(h) == _data.XFER_EBUSY:
+                    self._zombies.append((job, i, h, reply))
+                else:
+                    self._resolve(job, i, reply)

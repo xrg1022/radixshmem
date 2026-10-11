@@ -5,6 +5,7 @@
 the server starts waiting, a client brings the geometry, clients attach on use."""
 
 import os
+import threading
 import time
 import uuid
 
@@ -430,13 +431,14 @@ def test_stage_recycles_a_short_aux_allocation(cfg):
 
 
 class _Xfer:
-    """A SlotTransfer that completes a batch on its third poll; handles in
-    `hang` stay pending and refuse release, `reject` fails every read."""
+    """Completes on poll 3; `failed` reports failure, `hang` keeps release busy."""
 
     local_segment = "me"
 
     def __init__(self, data):
         self.d, self.polls, self.n, self.hang, self.reject = data, {}, 0, set(), False
+        self.failed = set()
+        self.release_blocked = threading.Event()
 
     def read(self, seg, remote, local, kind):
         if self.reject:
@@ -447,15 +449,56 @@ class _Xfer:
 
     def poll(self, h):
         self.polls[h] += 1
+        if h in self.failed:
+            return self.d.XferState.FAILED, 0
         if h in self.hang or self.polls[h] < 3:
             return self.d.XferState.PENDING, 0
         return self.d.XferState.COMPLETED, 4096
 
     def release(self, h):
-        return self.d.XFER_EBUSY if h in self.hang else self.d.XFER_OK
+        if h in self.hang:
+            self.release_blocked.set()
+            return self.d.XFER_EBUSY
+        return self.d.XFER_OK
 
 
-def test_server_jobs_complete_timeout_busy_and_expire(cfg):
+@pytest.mark.parametrize("failure", ["TIMEOUT", "FAILED"])
+def test_server_defers_failed_completion_until_batch_drains(cfg, failure):
+    from radixshmem import _data
+
+    srv = up(cfg(**data(data_bytes=1 << 20)), geometry())
+    x = _Xfer(_data)
+    try:
+        srv._xfer, srv._peers = x, {7: "peer"}
+        x.hang.add(1)
+        if failure == "FAILED":
+            x.failed.add(1)
+        item = (7, 0, [1, 2], [3, 4])
+        ticket = srv.submit([item], 0 if failure == "TIMEOUT" else 5000)
+        assert x.release_blocked.wait(2)
+
+        assert srv.wait_any([ticket], 100) == {"done": {}, "unknown": []}
+        assert srv._jobs[ticket].replies == [None]
+        assert srv.stats()["pending_jobs"] == 1 and srv.stats()["transfers"] == 0
+
+        x.hang.clear()
+        done, deadline = {}, time.monotonic() + 3
+        while not done and time.monotonic() < deadline:
+            done.update(srv.wait_any([ticket], 500)["done"])
+        reply = done[ticket][0]
+        assert reply[0] is False and failure in reply[3]
+        assert srv._zombies == []
+        assert srv.stats()["pending_jobs"] == 0 and srv.stats()["transfers"] == 1
+        assert srv.stats()["transfer_failures"] == 1
+        srv._reap()
+        assert srv.stats()["transfers"] == 1
+    finally:
+        x.hang.clear()
+        srv._xfer = None            # the fake must not be released as a real SlotTransfer
+        srv.close()
+
+
+def test_server_jobs_complete_busy_and_expire(cfg):
     from radixshmem import _data
 
     c = cfg(**data(data_bytes=1 << 20, max_inflight=2, max_pending_jobs=3, job_ttl_s=0.2))
@@ -475,11 +518,6 @@ def test_server_jobs_complete_timeout_busy_and_expire(cfg):
         done = collect([t1, t2])
         assert done[t1] == [(True, 4096, 1, "")] * 2 and done[t2] == [(True, 4096, 1, "")]
         assert srv.stats()["transfers"] == 3 and srv.stats()["pending_jobs"] == 0
-
-        x.hang.add(x.n + 1)
-        t3 = srv.submit([item], 100)
-        rep = collect([t3])[t3][0]
-        assert rep[0] is False and "TIMEOUT" in rep[3] and srv._zombies == [x.n]
 
         x.reject = True
         t4 = srv.submit([item], 1000)
