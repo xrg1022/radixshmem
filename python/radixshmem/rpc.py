@@ -24,6 +24,9 @@ import grpc
 SERVICE = "radixshmem.RadixNode"
 _OPTIONS = [("grpc.max_receive_message_length", -1), ("grpc.max_send_message_length", -1)]
 
+# Submit wire directions.
+OP_READ, OP_WRITE = 0, 1
+
 
 class DataPlaneUnavailable(RuntimeError):
     """The server runs index-only (no SlotStore) or is not ready."""

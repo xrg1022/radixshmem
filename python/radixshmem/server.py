@@ -582,9 +582,9 @@ class RadixServer:
             raise DataPlaneUnavailable("index-only server has no data plane")
         if self._xfer is None:
             raise DataPlaneUnavailable("standalone server has no peers")
-        job = _Job([(int(r), int(k), [int(x) for x in rs], [int(x) for x in ls])
-                    for r, k, rs, ls in items], time.monotonic() + timeout_ms / 1000)
-        for i, (rank, _, _, _) in enumerate(job.items):
+        job = _Job([(int(r), int(k), [int(x) for x in rs], [int(x) for x in ls], int(op))
+                    for r, k, rs, ls, op in items], time.monotonic() + timeout_ms / 1000)
+        for i, (rank, _, _, _, _) in enumerate(job.items):
             try:
                 job.segs.append(self._peer(rank))
             except Exception as e:  # noqa: BLE001
@@ -660,16 +660,22 @@ class RadixServer:
                     job = self._queue.popleft() if self._queue else None
                 if job is None:
                     break
-                for i, (rank, kind, remote, local) in enumerate(job.items):
+                for i, (rank, kind, remote, local, op) in enumerate(job.items):
                     if job.replies[i] is not None:
                         continue
                     try:
-                        h, nd = self._xfer.read(job.segs[i], remote, local, kind=ComponentType(kind))
+                        if op == rpc.OP_WRITE:
+                            h, nd = self._xfer.write(job.segs[i], local, remote,
+                                                     kind=ComponentType(kind))
+                        else:
+                            h, nd = self._xfer.read(job.segs[i], remote, local,
+                                                    kind=ComponentType(kind))
                     except Exception as e:  # noqa: BLE001
                         h, nd = _data.INVALID_BATCH, str(e)
                     if h == _data.INVALID_BATCH:
                         self._peers.pop(rank, None)
-                        self._resolve(job, i, (False, 0, 0, nd if isinstance(nd, str) else "read rejected"))
+                        self._resolve(job, i, (False, 0, 0,
+                                               nd if isinstance(nd, str) else "transfer rejected"))
                     else:
                         inflight.append((job, i, h, nd))
             progressed, now, still = False, time.monotonic(), []

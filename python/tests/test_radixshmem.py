@@ -248,6 +248,57 @@ def test_component_insert_smoke():
     print("  PASS: component_insert_smoke")
 
 
+def test_component_path_smoke():
+    all_components = (radixshmem.COMPONENT_MASK_FULL |
+                      radixshmem.COMPONENT_MASK_SWA |
+                      radixshmem.COMPONENT_MASK_MAMBA)
+    cfg = radixshmem._core.ShmConfig(max_nodes=1000, max_blocks=1000,
+                             component_mask=all_components, swa_window_blocks=4,
+                             mamba_state_bytes=256, swa_max_blocks=1000,
+                             mamba_max_slots=16)
+    server = radixshmem._core.RadixServer("/py_smoke_path_components", cfg)
+    client = radixshmem._core.RadixClient("/py_smoke_path_components")
+    SWA, MAMBA = radixshmem.ComponentType.SWA, radixshmem.ComponentType.MAMBA
+
+    hashes = radixshmem.compute_hashes(np.arange(21, 33, dtype=np.int64), 1)
+    full = client.allocate_slots(12)
+    assert client.insert(hashes, full).error == radixshmem.InsertError.OK
+    cps = {}
+    for end in (4, 8):                              # Checkpoints split the path.
+        m = client.allocate_slots(1, MAMBA)
+        assert client.insert(hashes[:end], m, component=MAMBA).error == radixshmem.InsertError.OK
+        cps[end] = int(m[0])
+    cells = {}
+    for lo, hi in ((0, 2), (3, 5), (8, 11)):
+        s = client.allocate_slots(hi - lo, SWA)
+        assert client.insert(hashes[:hi], s, component=SWA).error == radixshmem.InsertError.OK
+        cells[(lo, hi)] = list(s)
+
+    r = client.path_components(hashes)
+    assert r.status == radixshmem.RemoteStatus.OK and r.full_hit == 12
+    assert list(r.full_slots) == list(full)
+    assert [(off, list(s)) for _, off, s in r.swa_fragments] == \
+        [(lo, cells[(lo, hi)]) for lo, hi in ((0, 2), (3, 5), (8, 11))]
+    assert r.checkpoints == [(4, cps[4]), (8, cps[8])]
+    assert not bool(r.finalize)
+    r9 = client.path_components(hashes[:9])
+    assert r9.full_hit == 9 and [(off, off + len(s)) for _, off, s in r9.swa_fragments] == [(0, 2), (3, 5), (8, 9)]
+    assert [e for e, _ in r9.checkpoints] == [4, 8]
+    assert client.path_components(hashes, mask=radixshmem.COMPONENT_MASK_SWA).checkpoints == []
+
+    rl = client.path_components(hashes, lock=True)
+    assert bool(rl.finalize) and client.health_report().nodes_with_refs == 3
+    rl.finalize()
+    assert not bool(rl.finalize)
+    assert_healthy(client)
+    try:
+        client.path_components(hashes, mask=SWA)
+        assert False, "ComponentType is not a mask"
+    except TypeError:
+        pass
+    print("  PASS: path_components_smoke")
+
+
 
 
 def test_health_check_smoke():
@@ -291,5 +342,6 @@ if __name__ == "__main__":
     test_finalize_callable()
     test_component_query_smoke()
     test_component_insert_smoke()
+    test_component_path_smoke()
     test_health_check_smoke()
     print("\nAll tests passed.")

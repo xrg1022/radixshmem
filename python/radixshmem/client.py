@@ -1,10 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""RadixClient: index maintenance plus ``pull_async``, the one call that also
-moves bytes. It attaches the index (and, in data mode, the SlotStore) its
-RadixServer published; the server runs the transfers, this side stages local
-slots, submits, and publishes the result once the server reports completion.
+"""RadixClient: index maintenance plus ``pull_async`` / ``push_async``, the two
+calls that also move bytes. It attaches the index (and, in data mode, the
+SlotStore) its RadixServer published; the server runs the transfers, this side
+stages the slots, submits, and publishes the result once the server reports
+completion.
 
 A client can be built before its server is ready. ``RadixClient(name,
 geometry)`` hands the server the geometry (the Configure RPC) and returns at
@@ -23,10 +24,12 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 
 from radixshmem import _core, _geometry, rpc
-from radixshmem._core import COMPONENT_MASK_FULL, ComponentType
-from radixshmem.rpc import DataPlaneUnavailable, ServerNotReady
+from radixshmem._core import (COMPONENT_MASK_FULL, COMPONENT_MASK_MAMBA, COMPONENT_MASK_SWA,
+                            MAX_REMOTE_OP_BLOCKS, ComponentType, InsertError)
+from radixshmem.rpc import OP_READ, OP_WRITE, DataPlaneUnavailable, ServerNotReady
 
 FULL, SWA, MAMBA = ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA
+_LANE_MASK = {FULL: COMPONENT_MASK_FULL, SWA: COMPONENT_MASK_SWA, MAMBA: COMPONENT_MASK_MAMBA}
 
 # Server lifecycle. Whether there is a data plane is NodeInfo.data_plane.
 MODE_STARTING = "starting"          # start() has not finished its preflight
@@ -37,8 +40,8 @@ MODE_CLOSED = "closed"
 
 _ATTACH_TIMEOUT_MS = 30000          # a ready server's SlotStore is complete; attach never spins long
 
-# (peer_rank, kind, remote_slots, local_slots) -> (ok, bytes, descriptors, error)
-TransferItem = Tuple[int, int, List[int], List[int]]
+# (peer_rank, kind, remote_slots, local_slots, op) -> (ok, bytes, descriptors, error)
+TransferItem = Tuple[int, int, List[int], List[int], int]
 TransferReply = Tuple[bool, int, int, str]
 
 
@@ -74,6 +77,18 @@ class PullResult:
     remote_bytes: int
     source_rank: int
     finalize: Callable[[], None]
+
+
+@dataclass
+class PushResult:
+    """Prefix the target holds at job end (0 after a failed insert); remote_* as in PullResult;
+    target_rank is -1 when no target was chosen; local_evicted counts blocks evict_local freed."""
+
+    committed: int
+    remote_blocks: int
+    remote_bytes: int
+    target_rank: int
+    local_evicted: int = 0
 
 
 class PullJob:
@@ -125,6 +140,40 @@ class PullJob:
         self._client.cancel(self)
 
 
+class PushJob:
+    """Asynchronous push handle; cancellation is unsupported."""
+
+    def __init__(self, job_id: int, client: "RadixClient"):
+        self.job_id = job_id
+        self._client = client
+        self._f: concurrent.futures.Future = concurrent.futures.Future()
+        self._q = None                    # local source pin, held for the transfer
+        self._hashes: np.ndarray = np.empty(0, dtype=np.uint64)
+        self._rank = -1
+        self._start = 0                   # FULL prefix offset of the staged suffix
+        self._staged: Dict[ComponentType, np.ndarray] = {}   # target slots per lane
+        self._swa_fragments: List[Tuple[int, np.ndarray]] = []   # (offset, target slots)
+        self._checkpoints: List[Tuple[int, int]] = []            # (end_pos, target slot)
+        self._items: List[TransferItem] = []
+        self._ticket = -1
+        self._evict_local = False
+        self._aux_short = False           # a pushed aux lane failed to land: never evict the source
+        self._landed = 0                  # COMPONENT_MASK_* of the lanes the target now holds
+        self.remote_hit = 0
+        self.planned_push = 0
+
+    def done(self) -> bool:
+        return self._f.done()
+
+    def wait(self, timeout: Optional[float] = None) -> PushResult:
+        try:
+            r = self._f.result(timeout)
+        except concurrent.futures.TimeoutError:
+            raise TimeoutError(f"job {self.job_id} still running") from None
+        self._client._jobs.pop(self.job_id, None)
+        return r
+
+
 def _empty() -> np.ndarray:
     return np.empty(0, dtype=np.int32)
 
@@ -144,8 +193,8 @@ class _Rpc:
         return NodeInfo(**self._stub.call("Configure", {"geometry": spec}, timeout=30))
 
     def submit(self, items, timeout_ms) -> int:
-        req = {"items": [[int(r), int(k), [int(x) for x in rs], [int(x) for x in ls]]
-                         for r, k, rs, ls in items], "timeout_ms": int(timeout_ms)}
+        req = {"items": [[int(r), int(k), [int(x) for x in rs], [int(x) for x in ls], int(op)]
+                         for r, k, rs, ls, op in items], "timeout_ms": int(timeout_ms)}
         return int(self._stub.call("Submit", req, timeout=30)["ticket"])
 
     def wait_any(self, tickets, timeout_ms) -> Dict[str, Any]:
@@ -174,15 +223,18 @@ class RadixClient:
     ``geometry`` is what the server published; callers compare their own page
     size and bytes against it. Index methods (query, insert, allocate_slots,
     recycle_slots, flush, reset, check_health, stats) are those of the
-    underlying index client. ``max_outstanding`` bounds the jobs in flight;
-    ``pull_async`` blocks while it is reached.
+    underlying index client. ``pull_async`` brings a peer's blocks into local
+    slots; ``push_async`` writes a local prefix into a peer's slots and
+    publishes it there. ``max_outstanding`` bounds the jobs in flight; both
+    block while it is reached.
 
     ``local_read_only=True`` is the light form for processes that only read: it
     attaches the index and the SlotStore, never joins the cluster (no etcd,
     RDMA or RHT plane) and does not start a completer thread. ``query()`` is
-    always local, ``is_distributed()`` is False, and ``pull_async`` / ``insert``
-    / ``allocate_slots`` / ``recycle_slots`` / ``reset`` raise ``RuntimeError``;
-    ``info`` still carries the server's rank and world size."""
+    always local, ``is_distributed()`` is False, and ``pull_async`` /
+    ``push_async`` / ``insert`` / ``allocate_slots`` / ``recycle_slots`` /
+    ``reset`` raise ``RuntimeError``; ``info`` still carries the server's rank
+    and world size."""
 
     def __init__(self, name: str, geometry=None, *, endpoint: Optional[str] = None,
                  max_outstanding: int = 256, local_read_only: bool = False):
@@ -198,13 +250,16 @@ class RadixClient:
         except Exception:
             self._t.close()
             raise
-        self.transfer_failures = 0
-        self.staging_shortfalls = 0
-        self.promotion_shortfalls = 0
+        self.pull_transfer_failures = 0
+        self.pull_staging_shortfalls = 0
+        self.pull_promotion_shortfalls = 0
+        self.push_transfer_failures = 0
+        self.push_staging_shortfalls = 0
+        self.push_commit_shortfalls = 0
         self.saturated = 0
         self._mu = threading.Lock()
-        self._jobs: Dict[int, PullJob] = {}
-        self._pending: Dict[int, PullJob] = {}
+        self._jobs: Dict[int, Union[PullJob, PushJob]] = {}
+        self._pending: Dict[int, Union[PullJob, PushJob]] = {}
         self._next_id = 1
         self._slots = threading.Semaphore(max_outstanding)
         self._work = threading.Event()
@@ -307,39 +362,24 @@ class RadixClient:
         job._mask, job._lock = mask, lock
         job._q = q = self._index.query(job._hashes, mask=mask, local_only=False, lock=True,
                                        update_meta=True)
-        job._hit = self._stage(job, int(q.common_hit) if int(q.status) == 0 else 0)
+        job._hit = self._pull_stage(job, int(q.common_hit) if int(q.status) == 0 else 0)
         job.planned_hit = job._hit
         if not job._items:
-            self._complete(job, [])
+            self._pull_complete(job, [])
             return job
-        if block:
-            self._slots.acquire()
-        elif not self._slots.acquire(blocking=False):
-            self.saturated += 1
-            self._complete(job, [(False, 0, 0, "client saturated")] * len(job._items))
-            return job
-        try:
-            job._ticket = self._t.submit(job._items, timeout_ms)
-        except Exception as e:  # noqa: BLE001 - busy or unreachable server: local hit only
-            self._slots.release()
-            self._complete(job, [(False, 0, 0, str(e))] * len(job._items))
-            return job
-        with self._mu:
-            self._pending[job._ticket] = job
-            if self._completer is None:
-                self._completer = threading.Thread(target=self._run, name="radixshmem-completer",
-                                                   daemon=True)
-                self._completer.start()
-        self._work.set()
+        self._submit_job(job, timeout_ms, block, self._pull_complete)
         return job
 
-    def wait(self, job: Union[PullJob, int], timeout: Optional[float] = None) -> PullResult:
-        return (job if isinstance(job, PullJob) else self._jobs[job]).wait(timeout)
+    def wait(self, job: Union[PullJob, PushJob, int],
+             timeout: Optional[float] = None) -> Union[PullResult, PushResult]:
+        return (job if isinstance(job, (PullJob, PushJob)) else self._jobs[job]).wait(timeout)
 
     def cancel(self, job: Union[PullJob, int]) -> None:
         """See ``PullJob.cancel``. Under ``_mu`` so that a result set by the
         completer at the same moment still gets its pin released."""
-        job = job if isinstance(job, PullJob) else self._jobs[job]
+        job = self._jobs[job] if isinstance(job, int) else job
+        if not isinstance(job, PullJob):
+            raise TypeError("only pull jobs can be cancelled")
         with self._mu:
             job._cancelled = True
             self._jobs.pop(job.job_id, None)
@@ -348,10 +388,75 @@ class RadixClient:
         if r is not None:
             r.finalize()
 
-    def wait_any(self, jobs: Sequence[PullJob], timeout: Optional[float] = None) -> List[PullJob]:
+    def wait_any(self, jobs: Sequence[Union[PullJob, PushJob]],
+                 timeout: Optional[float] = None) -> List[Union[PullJob, PushJob]]:
         concurrent.futures.wait([j._f for j in jobs], timeout,
                                 return_when=concurrent.futures.FIRST_COMPLETED)
         return [j for j in jobs if j.done()]
+
+    def push_async(self, hashes, mask: int = COMPONENT_MASK_FULL, *,
+                   rank: Optional[int] = None, evict_local: bool = False,
+                   timeout_ms: int = 30000, block: bool = True) -> PushJob:
+        """Push up to MAX_REMOTE_OP_BLOCKS to rank (RHT-selected if None); evict_local frees eligible source paths."""
+        if self.local_read_only:
+            raise RuntimeError("local_read_only client: push_async needs the cluster plane; "
+                               "there is nothing to push through")
+        self.store
+        if rank is not None:
+            rank = int(rank)
+            if rank == int(self._index.rank()):
+                raise ValueError("push target is this node")
+        with self._mu:
+            job = PushJob(self._next_id, self)
+            self._next_id += 1
+            self._jobs[job.job_id] = job
+        h = np.ascontiguousarray(hashes, dtype=np.uint64)
+        job._hashes, job._rank = h[:MAX_REMOTE_OP_BLOCKS], (-1 if rank is None else rank)
+        job._evict_local = bool(evict_local)
+        n = len(job._hashes)
+        if n == 0:
+            self._push_finish(job, 0)
+            return job
+        if rank is None:                      # RHT routes are soft state: prepare checks the target
+            best = self._index.rht_probe(job._hashes)
+            if best is None:
+                self._push_finish(job, 0)
+                return job
+            job._rank = rank = int(best[0])
+        # Pin all source lanes until their WRITEs finish.
+        pa = self._index.path_components(job._hashes, mask=mask, lock=True)
+        full = min(int(pa.full_hit) if int(pa.status) == 0 else 0, n)
+        end = self._push_stage(job, pa, full)
+        hr = job.remote_hit
+        if end <= hr:
+            pa.finalize()
+            self._push_finish(job, hr)
+            return job
+        job._q = pa
+        self._submit_job(job, timeout_ms, block, self._push_complete)
+        return job
+
+    def _submit_job(self, job: Union[PullJob, PushJob], timeout_ms: int,
+                    block: bool, complete: Callable) -> None:
+        if block:
+            self._slots.acquire()
+        elif not self._slots.acquire(blocking=False):
+            self.saturated += 1
+            complete(job, [(False, 0, 0, "client saturated")] * len(job._items))
+            return
+        try:
+            job._ticket = self._t.submit(job._items, timeout_ms)
+        except Exception as e:  # noqa: BLE001
+            self._slots.release()
+            complete(job, [(False, 0, 0, str(e))] * len(job._items))
+            return
+        with self._mu:
+            self._pending[job._ticket] = job
+            if self._completer is None:
+                self._completer = threading.Thread(target=self._run, name="radixshmem-completer",
+                                                   daemon=True)
+                self._completer.start()
+        self._work.set()
 
     def _run(self) -> None:
         while not self._closed:
@@ -372,14 +477,16 @@ class RadixClient:
                 if job is None:
                     continue
                 replies = rep["done"].get(ticket) or [(False, 0, 0, lost)] * len(job._items)
+                complete = self._push_complete if isinstance(job, PushJob) else self._pull_complete
                 try:
-                    self._complete(job, replies)
+                    complete(job, replies)
                 except Exception as e:  # noqa: BLE001
-                    job._q.finalize()
+                    if job._q is not None:
+                        job._q.finalize()
                     job._f.set_exception(e)
                 self._slots.release()
 
-    def _stage(self, job: PullJob, hit: int) -> int:
+    def _pull_stage(self, job: PullJob, hit: int) -> int:
         q, me = job._q, int(self._index.rank())
         remote = [(int(r), int(o), np.asarray(s, dtype=np.int32))
                   for r, o, s in q.full_fragments if r >= 0 and r != me]
@@ -389,35 +496,36 @@ class RadixClient:
             st = self._index.allocate_slots(len(rs), FULL)
             if len(st) < len(rs):
                 self._recycle(st, FULL)
-                self.staging_shortfalls += 1
+                self.pull_staging_shortfalls += 1
                 return off
-            job._items.append((job._src, int(FULL), rs.tolist(), st.tolist()))
+            job._items.append((job._src, int(FULL), rs.tolist(), st.tolist(), OP_READ))
             job._staged[FULL] = (off, st)
         swa_rank, swa = int(q.swa_source_rank), np.asarray(q.swa_slots, dtype=np.int32)
         if len(swa) and swa_rank >= 0 and swa_rank != me:
             st = self._index.allocate_slots(len(swa), SWA)
             if len(st) == len(swa):
-                job._items.append((swa_rank, int(SWA), swa.tolist(), st.tolist()))
+                job._items.append((swa_rank, int(SWA), swa.tolist(), st.tolist(), OP_READ))
                 job._staged[SWA] = (0, st)
             else:
                 self._recycle(st, SWA)
-                self.staging_shortfalls += 1
+                self.pull_staging_shortfalls += 1
             job._src = swa_rank if job._src < 0 else job._src
         mamba = q.mamba
         if mamba is not None and int(mamba[0]) >= 0 and int(mamba[0]) != me:
             st = self._index.allocate_slots(1, MAMBA)
             if len(st) == 1:
-                job._items.append((int(mamba[0]), int(MAMBA), [int(mamba[1])], st.tolist()))
+                job._items.append((int(mamba[0]), int(MAMBA), [int(mamba[1])], st.tolist(),
+                                   OP_READ))
                 job._staged[MAMBA] = (0, st)
             else:
                 self._recycle(st, MAMBA)
-                self.staging_shortfalls += 1
+                self.pull_staging_shortfalls += 1
             job._src = int(mamba[0]) if job._src < 0 else job._src
         return hit
 
-    def _complete(self, job: PullJob, replies: Sequence[TransferReply]) -> None:
-        ok = {ComponentType(k): rep[0] for (_, k, _, _), rep in zip(job._items, replies)}
-        self.transfer_failures += sum(not v for v in ok.values())
+    def _pull_complete(self, job: PullJob, replies: Sequence[TransferReply]) -> None:
+        ok = {ComponentType(k): rep[0] for (_, k, _, _, _), rep in zip(job._items, replies)}
+        self.pull_transfer_failures += sum(not v for v in ok.values())
         job._q.finalize()   # unpinned parent absorbs the promoted leaf; an evicted prefix fails the insert (slots auto-recycled)
         hit, pulled, nbytes = job._hit, 0, 0
         if FULL in job._staged:
@@ -439,15 +547,15 @@ class RadixClient:
                 nbytes += len(st) * int(self._store.pool(kind).slot_bytes)
             else:
                 self._recycle(st, kind)
-        self._finish(job, hit, pulled, nbytes)
+        self._pull_finish(job, hit, pulled, nbytes)
 
-    def _finish(self, job: PullJob, hit: int, pulled: int = 0, nbytes: int = 0) -> None:
+    def _pull_finish(self, job: PullJob, hit: int, pulled: int = 0, nbytes: int = 0) -> None:
         lock = job._lock and not job._cancelled
         r = (self._index.query(job._hashes[:hit], mask=job._mask, local_only=True,
                                lock=lock, update_meta=False) if hit > 0 else None)
         common = int(r.common_hit) if r is not None and int(r.status) == 0 else 0
         if common < hit:
-            self.promotion_shortfalls += 1
+            self.pull_promotion_shortfalls += 1
         if common == 0:
             if r is not None:
                 r.finalize()
@@ -463,6 +571,121 @@ class RadixClient:
             job._f.set_result(res)
             if job._cancelled:      # cancelled between the pin above and here
                 res.finalize()
+
+    def _push_stage(self, job: PushJob, pa, full: int) -> int:
+        """Prepare target FULL and aux slots; return the granted FULL end."""
+        rank = job._rank
+        frags = [(int(off), np.asarray(s, dtype=np.int32)[:full - int(off)])
+                 for _, off, s in pa.swa_fragments if int(off) < full]
+        cps = [(int(e), int(s)) for e, s in pa.checkpoints if int(e) <= full]
+        entries = [(SWA, off + len(s), len(s)) for off, s in frags]
+        entries.extend((MAMBA, e, 1) for e, _ in cps)
+        rep = self._index.remote_prepare(rank, job._hashes, full, entries)
+        if int(rep.status) != 0:
+            return 0
+        job.remote_hit = hr = min(int(rep.remote_hit), len(job._hashes))
+        st = np.asarray(rep.full_slots, dtype=np.int32)
+        end = hr + len(st)
+        if end < full:
+            self.push_staging_shortfalls += 1
+        if end <= hr:
+            return hr
+        job._start = hr
+        job._staged[FULL] = st
+        job.planned_push = end - hr
+        job._items = [(rank, int(FULL), st.tolist(),
+                       np.asarray(pa.full_slots, dtype=np.int32)[hr:end].tolist(), OP_WRITE)]
+        # Send all aux state in [0, end), including the target's existing FULL prefix.
+        frags = [(off, s[:end - off]) for off, s in frags if off < end]
+        cps = [(e, s) for e, s in cps if e <= end]
+        lanes = []
+        if frags:
+            lanes.append((SWA, np.concatenate([s for _, s in frags]), rep.swa_slots))
+        if cps:
+            lanes.append((MAMBA, np.asarray([s for _, s in cps], dtype=np.int32), rep.mamba_slots))
+        for kind, local, slots in lanes:
+            st = np.asarray(slots, dtype=np.int32)
+            if len(st) != len(local):         # aux pools are all-or-none: short means skip the lane
+                self.push_staging_shortfalls += 1
+                job._aux_short = True
+                if len(st):
+                    self._index.remote_recycle(rank, st, component=kind)
+                continue
+            job._staged[kind] = st
+            job._items.append((rank, int(kind), st.tolist(), local.tolist(), OP_WRITE))
+            if kind == SWA:
+                pos = 0
+                for off, s in frags:
+                    job._swa_fragments.append((off, st[pos:pos + len(s)]))
+                    pos += len(s)
+            else:
+                job._checkpoints = [(e, int(st[i])) for i, (e, _) in enumerate(cps)]
+        return end
+
+    def _push_complete(self, job: PushJob, replies: Sequence[TransferReply]) -> None:
+        ok = {ComponentType(k): bool(rep[0]) for (_, k, _, _, _), rep in zip(job._items, replies)}
+        self.push_transfer_failures += sum(not v for v in ok.values())
+        if job._q is not None:      # the transfer is terminal: sources may be evicted again
+            job._q.finalize()
+            job._q = None
+        rank, hr, st = job._rank, job._start, job._staged[FULL]
+        committed, pushed, nbytes = hr, 0, 0
+        # Count successful WRITEs once, independently of index publication.
+        for kind, success in ok.items():
+            if success:
+                count = len(job._staged[kind])
+                pushed += count
+                nbytes += count * int(self._store.pool(kind).slot_bytes)
+        end = hr + len(st)
+        entries = []
+        for kind in (FULL, SWA, MAMBA):
+            if kind not in job._staged:
+                continue
+            if not (ok[FULL] and ok[kind]):
+                self._index.remote_recycle(rank, job._staged[kind], component=kind)
+                if kind != FULL:
+                    job._aux_short = True
+                continue
+            if kind == FULL:
+                entries.append((kind, end, st))
+            elif kind == SWA:
+                entries.extend((kind, off + len(s), s) for off, s in job._swa_fragments)
+            else:
+                entries.extend((kind, e, np.asarray([s], dtype=np.int32))
+                               for e, s in job._checkpoints)
+        if entries:
+            res = self._index.remote_commit(rank, job._hashes[:end], entries)
+            # A lost commit reply may hide publication: do not recycle its slots.
+            if int(res.status) != 0 or res.errors[0] != InsertError.OK or int(res.remote_hit) < end:
+                self.push_commit_shortfalls += 1
+                committed = 0
+            else:
+                committed = end
+                job._landed |= COMPONENT_MASK_FULL
+                for (kind, _, _), error in zip(entries[1:], res.errors[1:]):
+                    if error == InsertError.OK:
+                        job._landed |= _LANE_MASK[kind]
+                    else:
+                        self.push_commit_shortfalls += 1
+                        job._aux_short = True
+                        if error == InsertError.FULL_PATH_MISSING:
+                            committed = 0
+        self._push_finish(job, committed, pushed, nbytes)
+
+    def _push_finish(self, job: PushJob, committed: int, pushed: int = 0, nbytes: int = 0) -> None:
+        evicted = 0
+        if job._evict_local and committed > 0 and not job._aux_short and self._nothing_left_behind(job, committed):
+            evicted = max(0, int(self._index.evict_prefix(job._hashes[:committed])))   # source pin already dropped
+        job._f.set_result(PushResult(committed, pushed, nbytes, job._rank, evicted))
+
+    def _nothing_left_behind(self, job: PushJob, committed: int) -> bool:
+        """Migration may only drop the source when every lane it holds inside [0, committed) landed."""
+        left = _LANE_MASK[SWA] | _LANE_MASK[MAMBA]
+        left &= ~job._landed
+        if not left:
+            return True
+        pa = self._index.path_components(job._hashes[:committed], mask=left, lock=False)
+        return int(pa.status) == 0 and not len(pa.swa_fragments) and not len(pa.checkpoints)
 
     def _recycle(self, slots, kind: ComponentType) -> None:
         if len(slots):
