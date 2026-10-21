@@ -4,7 +4,8 @@
 """Two radix-server processes on one host, each owning index + SlotStore +
 transfer engine; a client configures node0, node1 takes the geometry from
 etcd, then a client on node1 pulls node0's blocks with concurrent
-pull_async() jobs.
+pull_async() jobs, and stages pushes to node0 from borrowed slots that node1
+never publishes (stage_push / submit_push / abort_push).
 
     python3 test_p2p_pull.py [--index-dev mlx5_bond_0] [--transfer-dev mlx5_bond_0] [--gid-idx 3]
 
@@ -33,8 +34,23 @@ PREFIX_LEN = 32
 SLOT_BYTES = 65536
 
 
+STAGED = (100, 101, 102, 103)   # extends the writer's prefix 0, fallback, aborted, no target
+EXTRA = 16                      # blocks each staged push adds
+
+
 def _pattern(k: int, i: int) -> bytes:
     return (struct.pack("<i", k * 1000 + i * 7 + 3) * (SLOT_BYTES // 4))[:SLOT_BYTES]
+
+
+def _staged_hashes(k: int):
+    import numpy as np
+    import radixshmem
+
+    if k == STAGED[0]:    # the writer's prefix 0 plus EXTRA new blocks
+        tokens = np.arange(1000, 1000 + PREFIX_LEN + EXTRA, dtype=np.int64)
+    else:                 # a prefix no node holds
+        tokens = np.arange(1000 * k, 1000 * k + EXTRA, dtype=np.int64)
+    return radixshmem.compute_hashes(tokens, 1)
 
 
 def client_main(role: str, endpoint: str) -> int:
@@ -67,6 +83,37 @@ def client_main(role: str, endpoint: str) -> int:
             r.finalize()
         out["local_hit_after"] = sum(int(c.query(h, local_only=True, update_meta=False).common_hit)
                                      for h in hs)
+    elif role == "stager":
+        used = int(c.mempool_used())
+        peer = 1 - c.rank()
+
+        def push(sp, k):
+            for i, s in enumerate(sp.local_slots):
+                c.slot_view(int(s))[:] = _pattern(k, sp.start + i)
+            r = c.submit_push(sp).wait(120)
+            return [sp.rank, sp.start, sp.end, r.committed, r.remote_blocks]
+
+        ext, fresh, aborted, lost = (_staged_hashes(k) for k in STAGED)
+        out["rht"] = push(c.stage_push(ext), STAGED[0])
+        out["fallback"] = push(c.stage_push(fresh, fallback_rank=peer), STAGED[1])
+        sp = c.stage_push(aborted, rank=peer)
+        out["aborted"] = [sp.rank, sp.start, sp.end]
+        c.abort_push(sp)
+        sp = c.stage_push(lost)
+        out["no_target"] = [sp.rank, sp.start, sp.end]
+        c.submit_push(sp).wait(10)
+        out["local_hits"] = [int(c.query(h, local_only=True, update_meta=False).common_hit)
+                             for h in (ext, fresh, aborted)]
+        out["borrowed_returned"] = int(c.mempool_used()) == used
+    elif role == "staged_check":
+        out["hits"], out["bytes_ok"] = [], 0
+        for k in STAGED[:3]:
+            q = c.query(_staged_hashes(k), local_only=True, update_meta=False)
+            out["hits"].append(int(q.common_hit))
+            slots = [int(s) for _, _, run in q.full_fragments for s in run][:int(q.common_hit)]
+            first = PREFIX_LEN if k == STAGED[0] else 0
+            out["bytes_ok"] += sum(bytes(c.slot_view(s)) == _pattern(k, i)
+                                   for i, s in enumerate(slots) if i >= first)
     elif role == "health":
         out["health"] = int(c.check_health())
         out["report"] = c.health_report().describe().strip()
@@ -172,7 +219,10 @@ def orchestrate(a) -> int:
                    "--endpoint", endpoints[i], "--registry", registry, "--cluster-id", cluster_id,
                    "--expected-min-nodes", "2", "--rpc-address", "0.0.0.0", "--transfer-ip", "127.0.0.1",
                    "--gid-idx", str(a.gid_idx), "--bootstrap-timeout", str(a.bootstrap_timeout),
-                   "--background-evict-ratio", "0", "--interval", "0"]
+                   "--background-evict-ratio", "0", "--interval", "0",
+                   # staged pushes: prepare/commit on the peer; 4 RHT slots keep node0's
+                   # route to a prefix node1 has since pulled and republished
+                   "--enable-remote-insert", "--rht-slots", "4"]
             cmd += ["--index-dev", a.index_dev] if a.index_dev else []
             cmd += [f"--transfer-dev={d}" for d in a.transfer_dev]
             servers.append(subprocess.Popen(cmd, stdout=open(logs[i], "wb"), stderr=subprocess.STDOUT,
@@ -232,7 +282,24 @@ def orchestrate(a) -> int:
         check(r["bytes_ok"] == total, "every slot holds the writer's bytes")
         check(r["local_hit_after"] == total, "node1 now serves the prefixes locally")
 
-        print("\n[5] both trees are leak-free")
+        print("\n[5] node1 stages pushes to node0 in borrowed slots it never publishes")
+        s, = run_clients([("stager", endpoints[1])])
+        print(f"  {s}")
+        n = PREFIX_LEN + EXTRA
+        check(s["rht"] == [ranks[0], PREFIX_LEN, n, n, EXTRA],
+              f"the RHT chose rank {ranks[0]}; only its {EXTRA} missing blocks were written and committed")
+        check(s["fallback"] == [ranks[0], 0, EXTRA, EXTRA, EXTRA],
+              "fallback_rank took a prefix the RHT does not route")
+        check(s["aborted"] == [ranks[0], 0, EXTRA], "an aborted push reserved its blocks first")
+        check(s["no_target"] == [-1, 0, 0], "no route and no fallback stages nothing")
+        check(s["local_hits"] == [PREFIX_LEN, 0, 0], "node1 published none of the staged blocks")
+        check(s["borrowed_returned"], "node1 got every borrowed slot back")
+        p, = run_clients([("staged_check", endpoints[0])])
+        print(f"  {p}")
+        check(p["hits"] == [n, EXTRA, 0], "node0 serves the pushed blocks and not the aborted ones")
+        check(p["bytes_ok"] == 2 * EXTRA, "every pushed slot on node0 holds the staged bytes")
+
+        print("\n[6] both trees are leak-free")
         for i, h in enumerate(run_clients([("health", endpoints[0]), ("health", endpoints[1])])):
             check(h["health"] == 0, f"node{i} check_health == 0 ({h['report']})")
         print("\nPASS")

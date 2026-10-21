@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""RadixClient: index maintenance plus ``pull_async`` / ``push_async``, the two
-calls that also move bytes. It attaches the index (and, in data mode, the
+"""RadixClient: index maintenance plus ``pull_async`` and the staged push
+(``stage_push`` / ``submit_push``), the calls that also move bytes. It attaches the index (and, in data mode, the
 SlotStore) its RadixServer published; the server runs the transfers, this side
 stages the slots, submits, and publishes the result once the server reports
 completion.
@@ -18,18 +18,16 @@ from __future__ import annotations
 
 import concurrent.futures
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
 from radixshmem import _core, _geometry, rpc
-from radixshmem._core import (COMPONENT_MASK_FULL, COMPONENT_MASK_MAMBA, COMPONENT_MASK_SWA,
-                            MAX_REMOTE_OP_BLOCKS, ComponentType, InsertError)
+from radixshmem._core import COMPONENT_MASK_FULL, MAX_REMOTE_OP_BLOCKS, ComponentType, InsertError
 from radixshmem.rpc import OP_READ, OP_WRITE, DataPlaneUnavailable, ServerNotReady
 
 FULL, SWA, MAMBA = ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA
-_LANE_MASK = {FULL: COMPONENT_MASK_FULL, SWA: COMPONENT_MASK_SWA, MAMBA: COMPONENT_MASK_MAMBA}
 
 # Server lifecycle. Whether there is a data plane is NodeInfo.data_plane.
 MODE_STARTING = "starting"          # start() has not finished its preflight
@@ -82,13 +80,30 @@ class PullResult:
 @dataclass
 class PushResult:
     """Prefix the target holds at job end (0 after a failed insert); remote_* as in PullResult;
-    target_rank is -1 when no target was chosen; local_evicted counts blocks evict_local freed."""
+    target_rank is -1 when no target was chosen."""
 
     committed: int
     remote_blocks: int
     remote_bytes: int
     target_rank: int
-    local_evicted: int = 0
+
+
+@dataclass
+class StagedPush:
+    """One push staged by ``stage_push()``: ``rank`` holds ``hashes[:start]`` and
+    reserved ``remote_slots`` for ``hashes[start:end]``; ``local_slots`` are
+    borrowed from this node's FULL pool and never published here. The caller
+    writes block ``start + i`` into ``local_slots[i]``, then hands this to
+    ``submit_push()`` or ``abort_push()`` exactly once. ``rank`` is -1 when no
+    target was found; ``end == start`` means there is nothing to write."""
+
+    rank: int
+    hashes: np.ndarray
+    start: int
+    end: int
+    local_slots: np.ndarray
+    remote_slots: np.ndarray
+    _used: bool = field(default=False, init=False, repr=False)
 
 
 class PullJob:
@@ -156,9 +171,7 @@ class PushJob:
         self._checkpoints: List[Tuple[int, int]] = []            # (end_pos, target slot)
         self._items: List[TransferItem] = []
         self._ticket = -1
-        self._evict_local = False
-        self._aux_short = False           # a pushed aux lane failed to land: never evict the source
-        self._landed = 0                  # COMPONENT_MASK_* of the lanes the target now holds
+        self._sp: Optional[StagedPush] = None   # set by submit_push(): the source is borrowed slots
         self.remote_hit = 0
         self.planned_push = 0
 
@@ -224,15 +237,16 @@ class RadixClient:
     size and bytes against it. Index methods (query, insert, allocate_slots,
     recycle_slots, flush, reset, check_health, stats) are those of the
     underlying index client. ``pull_async`` brings a peer's blocks into local
-    slots; ``push_async`` writes a local prefix into a peer's slots and
-    publishes it there. ``max_outstanding`` bounds the jobs in flight; both
-    block while it is reached.
+    slots; ``stage_push`` / ``submit_push`` write blocks the caller put into
+    borrowed local slots into a peer's slots and publish them there, never on
+    this node. ``max_outstanding`` bounds the jobs in flight; both block while
+    it is reached.
 
     ``local_read_only=True`` is the light form for processes that only read: it
     attaches the index and the SlotStore, never joins the cluster (no etcd,
     RDMA or RHT plane) and does not start a completer thread. ``query()`` is
     always local, ``is_distributed()`` is False, and ``pull_async`` /
-    ``push_async`` / ``insert`` / ``allocate_slots`` / ``recycle_slots`` /
+    ``stage_push`` / ``insert`` / ``allocate_slots`` / ``recycle_slots`` /
     ``reset`` raise ``RuntimeError``; ``info`` still carries the server's rank
     and world size."""
 
@@ -394,50 +408,100 @@ class RadixClient:
                                 return_when=concurrent.futures.FIRST_COMPLETED)
         return [j for j in jobs if j.done()]
 
-    def push_async(self, hashes, mask: int = COMPONENT_MASK_FULL, *,
-                   rank: Optional[int] = None, evict_local: bool = False,
-                   timeout_ms: int = 30000, block: bool = True) -> PushJob:
-        """Push up to MAX_REMOTE_OP_BLOCKS to rank (RHT-selected if None); evict_local frees eligible source paths."""
+    # ------------------------------------------------------------ staged push
+
+    def stage_push(self, hashes, *, rank: Optional[int] = None,
+                   fallback_rank: Optional[int] = None) -> StagedPush:
+        """Reserve on a peer the FULL blocks of ``hashes`` it lacks and borrow as
+        many local slots to stage them in; nothing is published on this node.
+        The target is ``rank``, else the RHT's deepest holder, else
+        ``fallback_rank``. One remote_prepare both reads the peer's hit and
+        reserves the rest, so the staged range cannot drift from the grant."""
         if self.local_read_only:
-            raise RuntimeError("local_read_only client: push_async needs the cluster plane; "
-                               "there is nothing to push through")
+            raise RuntimeError("local_read_only client: stage_push needs the cluster plane")
         self.store
-        if rank is not None:
-            rank = int(rank)
-            if rank == int(self._index.rank()):
-                raise ValueError("push target is this node")
+        h = np.ascontiguousarray(hashes, dtype=np.uint64)[:MAX_REMOTE_OP_BLOCKS]
+        if rank is None and len(h):
+            best = self._index.rht_probe(h)
+            rank = int(best[0]) if best is not None else fallback_rank
+        if rank is None or len(h) == 0:
+            return StagedPush(-1, h, 0, 0, _empty(), _empty())
+        rank = int(rank)
+        if rank == int(self._index.rank()):
+            raise ValueError("push target is this node")
+        rep = self._index.remote_prepare(rank, h, len(h), [])
+        if int(rep.status) != 0:
+            return StagedPush(rank, h, 0, 0, _empty(), _empty())
+        hr = min(int(rep.remote_hit), len(h))
+        remote = np.asarray(rep.full_slots, dtype=np.int32)
+        want = min(len(remote), int(self._index.mempool_total()))
+        local = self._index.allocate_slots(want, FULL) if want > 0 else _empty()
+        local = np.asarray(local, dtype=np.int32)
+        if len(local) < len(remote):      # stage what fits; the peer keeps no surplus
+            self.push_staging_shortfalls += 1
+            self._index.remote_recycle(rank, remote[len(local):], component=FULL)
+            remote = remote[:len(local)]
+        return StagedPush(rank, h, hr, hr + len(local), local, remote)
+
+    def submit_push(self, sp: StagedPush, *, timeout_ms: int = 30000,
+                    block: bool = True) -> PushJob:
+        """WRITE the staged slots to the peer and publish them there. Call only
+        after every block is in ``sp.local_slots``. The borrowed slots return
+        to this node's pool when the WRITE ends, whatever its outcome."""
+        self._consume(sp)
         with self._mu:
             job = PushJob(self._next_id, self)
             self._next_id += 1
             self._jobs[job.job_id] = job
-        h = np.ascontiguousarray(hashes, dtype=np.uint64)
-        job._hashes, job._rank = h[:MAX_REMOTE_OP_BLOCKS], (-1 if rank is None else rank)
-        job._evict_local = bool(evict_local)
-        n = len(job._hashes)
-        if n == 0:
-            self._push_finish(job, 0)
+        job._sp, job._hashes, job._rank = sp, sp.hashes, sp.rank
+        job._start = job.remote_hit = sp.start
+        job.planned_push = sp.end - sp.start
+        if sp.end <= sp.start:
+            job._f.set_result(PushResult(sp.start, 0, 0, sp.rank))
             return job
-        if rank is None:                      # RHT routes are soft state: prepare checks the target
-            best = self._index.rht_probe(job._hashes)
-            if best is None:
-                self._push_finish(job, 0)
-                return job
-            job._rank = rank = int(best[0])
-        # Pin all source lanes until their WRITEs finish.
-        pa = self._index.path_components(job._hashes, mask=mask, lock=True)
-        full = min(int(pa.full_hit) if int(pa.status) == 0 else 0, n)
-        end = self._push_stage(job, pa, full)
-        hr = job.remote_hit
-        if end <= hr:
-            pa.finalize()
-            self._push_finish(job, hr)
-            return job
-        job._q = pa
-        self._submit_job(job, timeout_ms, block, self._push_complete)
+        job._items = [(sp.rank, int(FULL), sp.remote_slots.tolist(), sp.local_slots.tolist(),
+                       OP_WRITE)]
+        self._submit_job(job, timeout_ms, block, self._staged_push_complete)
         return job
+
+    def abort_push(self, sp: StagedPush) -> None:
+        """Give back both sides of a staged push that will not be submitted."""
+        self._consume(sp)
+        if len(sp.remote_slots):
+            self._index.remote_recycle(sp.rank, sp.remote_slots, component=FULL)
+        self._recycle(sp.local_slots, FULL)
+
+    def _consume(self, sp: StagedPush) -> None:
+        # A second submit/abort would recycle the same slots twice.
+        with self._mu:
+            if sp._used:
+                raise RuntimeError("staged push was already submitted or aborted")
+            sp._used = True
+
+    def _staged_push_complete(self, job: PushJob, replies: Sequence[TransferReply]) -> None:
+        sp = job._sp
+        self._recycle(sp.local_slots, FULL)     # the WRITE has drained: the source is free
+        if not replies[0][0]:
+            self.push_transfer_failures += 1
+            self._index.remote_recycle(sp.rank, sp.remote_slots, component=FULL)
+            job._f.set_result(PushResult(sp.start, 0, 0, sp.rank))
+            return
+        n = len(sp.local_slots)
+        nbytes = n * int(self._store.pool(FULL).slot_bytes)
+        res = self._index.remote_commit(sp.rank, sp.hashes[:sp.end],
+                                        [(FULL, sp.end, sp.remote_slots)])
+        # The peer recycled a failed insert itself; a lost reply may hide publication.
+        # Either way the reserved slots are no longer ours to recycle.
+        if int(res.status) != 0 or res.errors[0] != InsertError.OK or int(res.remote_hit) < sp.end:
+            self.push_commit_shortfalls += 1
+            committed = 0
+        else:
+            committed = sp.end
+        job._f.set_result(PushResult(committed, n, nbytes, sp.rank))
 
     def _submit_job(self, job: Union[PullJob, PushJob], timeout_ms: int,
                     block: bool, complete: Callable) -> None:
+        job._complete = complete          # what the completer calls with the replies
         if block:
             self._slots.acquire()
         elif not self._slots.acquire(blocking=False):
@@ -477,9 +541,8 @@ class RadixClient:
                 if job is None:
                     continue
                 replies = rep["done"].get(ticket) or [(False, 0, 0, lost)] * len(job._items)
-                complete = self._push_complete if isinstance(job, PushJob) else self._pull_complete
                 try:
-                    complete(job, replies)
+                    job._complete(job, replies)
                 except Exception as e:  # noqa: BLE001
                     if job._q is not None:
                         job._q.finalize()
@@ -572,6 +635,9 @@ class RadixClient:
             if job._cancelled:      # cancelled between the pin above and here
                 res.finalize()
 
+    # Aux-lane push (SWA / Mamba) from a pinned local path (path_components). No caller
+    # until stage_push carries aux lanes; kept as the prepare/commit logic for them.
+
     def _push_stage(self, job: PushJob, pa, full: int) -> int:
         """Prepare target FULL and aux slots; return the granted FULL end."""
         rank = job._rank
@@ -607,7 +673,6 @@ class RadixClient:
             st = np.asarray(slots, dtype=np.int32)
             if len(st) != len(local):         # aux pools are all-or-none: short means skip the lane
                 self.push_staging_shortfalls += 1
-                job._aux_short = True
                 if len(st):
                     self._index.remote_recycle(rank, st, component=kind)
                 continue
@@ -643,8 +708,6 @@ class RadixClient:
                 continue
             if not (ok[FULL] and ok[kind]):
                 self._index.remote_recycle(rank, job._staged[kind], component=kind)
-                if kind != FULL:
-                    job._aux_short = True
                 continue
             if kind == FULL:
                 entries.append((kind, end, st))
@@ -661,31 +724,12 @@ class RadixClient:
                 committed = 0
             else:
                 committed = end
-                job._landed |= COMPONENT_MASK_FULL
-                for (kind, _, _), error in zip(entries[1:], res.errors[1:]):
-                    if error == InsertError.OK:
-                        job._landed |= _LANE_MASK[kind]
-                    else:
+                for error in res.errors[1:]:
+                    if error != InsertError.OK:
                         self.push_commit_shortfalls += 1
-                        job._aux_short = True
                         if error == InsertError.FULL_PATH_MISSING:
                             committed = 0
-        self._push_finish(job, committed, pushed, nbytes)
-
-    def _push_finish(self, job: PushJob, committed: int, pushed: int = 0, nbytes: int = 0) -> None:
-        evicted = 0
-        if job._evict_local and committed > 0 and not job._aux_short and self._nothing_left_behind(job, committed):
-            evicted = max(0, int(self._index.evict_prefix(job._hashes[:committed])))   # source pin already dropped
-        job._f.set_result(PushResult(committed, pushed, nbytes, job._rank, evicted))
-
-    def _nothing_left_behind(self, job: PushJob, committed: int) -> bool:
-        """Migration may only drop the source when every lane it holds inside [0, committed) landed."""
-        left = _LANE_MASK[SWA] | _LANE_MASK[MAMBA]
-        left &= ~job._landed
-        if not left:
-            return True
-        pa = self._index.path_components(job._hashes[:committed], mask=left, lock=False)
-        return int(pa.status) == 0 and not len(pa.swa_fragments) and not len(pa.checkpoints)
+        job._f.set_result(PushResult(committed, pushed, nbytes, rank))
 
     def _recycle(self, slots, kind: ComponentType) -> None:
         if len(slots):

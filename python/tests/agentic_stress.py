@@ -18,9 +18,10 @@ generate the new blocks' bytes -> think -> allocate, write, insert. Block
 bytes are a function of the block hash h: FULL [h, h+1, ...], SWA [~h, ~h+1,
 ...], Mamba [h, h-1, ...] as uint64 words, so a reader can check what it got.
 --index-only keeps the old index-only flow: query -> think -> insert.
---push adds push_async(rank=None) after every insert, to the peer the RHT
-picks (--push-evict migrates instead of copying); --worker-hosts together
-with --remote-cmd starts ranks on other hosts.
+--push stages each turn's FULL blocks in borrowed slots after the insert, fills
+them from the local copy (standing in for the engine's D2H) and pushes them to
+the peer the RHT picks; --worker-hosts together with --remote-cmd starts ranks
+on other hosts.
 
     python tests/agentic_stress.py                      # defaults: 8 nodes, 128 sessions, 60 s
     python tests/agentic_stress.py --nodes 2 --concurrency 16 --duration 20 --index-only
@@ -103,7 +104,6 @@ class Config:
     rht_slots: int = 4                # RHT slots per bucket (W)
     flush_after_insert: bool = False  # drain async RHT writes before DONE
     push: bool = False
-    push_evict: bool = False          # push with evict_local=True: migrate instead of copy
     # cross-host: per-rank host IPs (empty = every rank on this host, loopback);
     # ranks whose host differs from local_host are started through remote_cmd
     # ("{host}" placeholder, e.g. "ssh root@{host} docker exec -i c python3 .../agentic_stress.py")
@@ -172,9 +172,7 @@ def parse_args():
                    default=d.flush_after_insert,
                    help="client.flush() after insert so RHT routes land before DONE")
     p.add_argument("--push", action="store_true", default=d.push,
-                   help="after each insert push_async(rank=None) the turn to the RHT-chosen peer")
-    p.add_argument("--push-evict", action="store_true", default=d.push_evict,
-                   help="push with evict_local=True: drop the local copy once the target holds it (implies --push)")
+                   help="after each insert, stage_push / submit_push the turn to the RHT-chosen peer")
     p.add_argument("--worker-hosts", default=d.worker_hosts,
                    help="comma list of per-rank host IPs; ranks not on --local-host start via --remote-cmd")
     p.add_argument("--local-host", default=d.local_host)
@@ -197,7 +195,6 @@ def parse_args():
     else:
         cfg = Config(**{k: getattr(a, k) for k in Config.__dataclass_fields__
                         if hasattr(a, k)})
-    cfg.push = cfg.push or cfg.push_evict
     return cfg, a.role, a.rank
 
 
@@ -360,7 +357,8 @@ class Worker:
         self.peak_depth = 0
         self.errors: Dict[str, int] = {}
         self.bad_blocks = 0
-        self.push_outcomes = {"capped": 0, "no_target": 0, "failed": 0, "partial": 0}
+        self.push_outcomes = {"capped": 0, "no_target": 0, "failed": 0, "partial": 0,
+                              "source_evicted": 0}
         self.lock = threading.Lock()
         # data mode: one uint64 view per pool, (num_slots, stride / 8)
         self.pools: Dict[object, np.ndarray] = {}
@@ -377,6 +375,26 @@ class Worker:
     def local_full_hit(self, hashes: np.ndarray) -> int:
         return int(self.client.query(hashes, mask=radixshmem.COMPONENT_MASK_FULL, local_only=True,
                                      lock=False, update_meta=False).common_hit)
+
+    def staged_push(self, hashes: np.ndarray):
+        """stage_push, copy the blocks the peer lacks from the local copy into the
+        borrowed slots (the engine's D2H in a deployment), submit_push. None when
+        the local copy was evicted before it could be copied."""
+        c = self.client
+        sp = c.stage_push(hashes)
+        if sp.end > sp.start:
+            q = c.query(hashes[:sp.end], mask=radixshmem.COMPONENT_MASK_FULL, local_only=True,
+                        lock=True, update_meta=False)
+            runs = [np.asarray(s, dtype=np.int64) for _, _, s in q.full_fragments]
+            src = np.concatenate(runs)[sp.start:sp.end] if runs else np.empty(0, np.int64)
+            whole = int(q.common_hit) >= sp.end and len(src) == sp.end - sp.start
+            if whole:
+                self.pools[FULL][sp.local_slots] = self.pools[FULL][src]
+            q.finalize()
+            if not whole:
+                c.abort_push(sp)
+                return None
+        return c.submit_push(sp).wait()
 
     def verify(self, r, inp: np.ndarray) -> int:
         """Blocks of a PullResult whose bytes do not follow kv_pattern."""
@@ -517,23 +535,25 @@ class Worker:
             c.flush()
         insert_us = (time.perf_counter() - t1) * 1e6
 
-        push_us, push_blocks, push_bytes, push_evicted = 0.0, 0, 0, 0
+        push_us, push_blocks, push_bytes = 0.0, 0, 0
         if self.cfg.push and n > 0:
             outcome = ""
             if n > radixshmem.MAX_REMOTE_OP_BLOCKS:
                 outcome = "capped"
             else:
                 t_p = time.perf_counter()
-                pr = c.push_async(hashes[:n], mask=self.mask, evict_local=self.cfg.push_evict).wait()
+                pr = self.staged_push(hashes[:n])
                 push_us = (time.perf_counter() - t_p) * 1e6
-                push_blocks, push_bytes = int(pr.remote_blocks), int(pr.remote_bytes)
-                push_evicted = int(pr.local_evicted)
-                if pr.target_rank < 0:
-                    outcome = "no_target"
-                elif pr.committed == 0:
-                    outcome = "failed"
-                elif pr.committed < n:
-                    outcome = "partial"
+                if pr is None:
+                    outcome = "source_evicted"
+                else:
+                    push_blocks, push_bytes = int(pr.remote_blocks), int(pr.remote_bytes)
+                    if pr.target_rank < 0:
+                        outcome = "no_target"
+                    elif pr.committed == 0:
+                        outcome = "failed"
+                    elif pr.committed < n:
+                        outcome = "partial"
             if outcome:
                 with self.lock:
                     self.push_outcomes[outcome] += 1
@@ -551,7 +571,6 @@ class Worker:
             "rdma_reads": rdma_reads, "rdma_atomics": rdma_atomics,
             "inserted_blocks": max(0, n - have), "finalize_us": finalize_us, "error": err,
             "push_us": push_us, "push_blocks": push_blocks, "push_bytes": push_bytes,
-            "push_evicted": push_evicted,
             "diag": diag,
         }
 
@@ -720,7 +739,7 @@ class Recorder:
     FIELDS = ["t", "worker", "turn", "input_blocks", "history_blocks",
               "actual_hit", "local_hit", "remote_hit", "query_us", "insert_us",
               "insert_full_us", "rdma_reads", "rdma_atomics", "inserted_blocks", "verify_us",
-              "xfer_us", "remote_bytes", "push_us", "push_blocks", "push_bytes", "push_evicted"]
+              "xfer_us", "remote_bytes", "push_us", "push_blocks", "push_bytes"]
 
     def __init__(self):
         self.rows: List[tuple] = []
@@ -745,7 +764,7 @@ class Recorder:
                           done["inserted_blocks"], done.get("verify_us", 0.0),
                           done.get("xfer_us", 0.0), done.get("remote_bytes", 0),
                           done.get("push_us", 0.0), done.get("push_blocks", 0),
-                          done.get("push_bytes", 0), done.get("push_evicted", 0)))
+                          done.get("push_bytes", 0)))
         if done["error"]:
             self.errors[done["error"]] = self.errors.get(done["error"], 0) + 1
         if self.miss_log is not None and done["actual_hit"] < req["history_blocks"]:
@@ -983,9 +1002,8 @@ def build_report(cfg: Config, rec: Recorder, stats: List[Optional[dict]]) -> dic
         if cfg.push:
             pu, pb = steady[:, 17], steady[:, 19]
             ran, moved = pu > 0, pb > 0
-            rep["push"] = {   # Slot counts include all lanes.
+            rep["push"] = {   # FULL slots only
                 "pushed_bytes": float(pb.sum()), "pushed_slots": float(steady[:, 18].sum()),
-                "evicted_blocks": float(steady[:, 20].sum()),
                 "push_requests": int(ran.sum()), "moving_requests": int(moved.sum()),
                 "aggregate_mbps": float(pb.sum() / span / 1e6),
                 "push_us": pct(pu[ran]) if ran.any() else {},
@@ -1023,7 +1041,7 @@ def print_report(rep: dict):
           f"concurrency={rep['config']['concurrency']}  aux={rep['config']['aux']}  "
           f"W={rep['config']['swa_window']}  cs={rep['config']['register_chunk_size']}  "
           f"rht_slots={rep['config']['rht_slots']}  flush={rep['config']['flush_after_insert']}  "
-          f"push={rep['config']['push']}{'+evict' if rep['config']['push_evict'] else ''}  "
+          f"push={rep['config']['push']}  "
           f"max_blocks={rep['config']['max_blocks']}")
     print(f"warmup {t['warmup_sec']:.1f}s  measured {t['measured_sec']:.1f}s "
           f"(incl. drain {t['drain_sec']:.1f}s / {t['drain_requests']} req)")
@@ -1047,8 +1065,7 @@ def print_report(rep: dict):
     if pu:
         print(f"push: {pu['pushed_bytes'] / 1e6:.2f} MB / {pu['pushed_slots']:.0f} slots in "
               f"{pu['moving_requests']} of {pu['push_requests']} pushes  "
-              f"aggregate {pu['aggregate_mbps']:.2f} MB/s"
-              + (f"  evicted {pu['evicted_blocks']:.0f} blocks" if rep["config"]["push_evict"] else ""))
+              f"aggregate {pu['aggregate_mbps']:.2f} MB/s")
         if pu["push_us"]:
             print(f"     push us         {fmt_lat(pu['push_us'])}")
         if pu["bandwidth_mbps"]:

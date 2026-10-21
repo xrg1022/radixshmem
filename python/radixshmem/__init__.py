@@ -6,7 +6,8 @@
 Public surface: ``RadixServer`` (one per node: index, SlotStore, P2P transfer;
 started from a ``ServerConfig`` and configured by a client's ``Geometry``) and
 ``RadixClient`` (hands the server its geometry, ``status`` / ``wait_ready``,
-index ops plus ``pull_async`` / ``push_async``). The pybind modules ``_core``
+index ops plus ``pull_async`` and the staged push ``stage_push`` /
+``submit_push`` / ``abort_push``). The pybind modules ``_core``
 (index) and ``_data`` (SlotStore, transfer) stay importable for tests and
 advanced users.
 """
@@ -37,7 +38,8 @@ except ImportError:
     pass
 
 from radixshmem._geometry import Geometry, check_pools_aligned
-from radixshmem.client import NodeInfo, PullJob, PullResult, PushJob, PushResult, RadixClient
+from radixshmem.client import (NodeInfo, PullJob, PullResult, PushJob, PushResult, RadixClient,
+                               StagedPush)
 from radixshmem.rpc import (OP_READ, OP_WRITE, DataPlaneUnavailable, GeometryMismatch, ServerBusy,
                           ServerNotReady)
 from radixshmem.server import ClusterConfig, RadixServer, ServerConfig
@@ -73,6 +75,7 @@ __all__ = [
     "RadixServer",
     "RemoteStatus",
     "ServerBusy",
+    "StagedPush",
     "ServerConfig",
     "ServerNotReady",
     "check_pools_aligned",

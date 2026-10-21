@@ -66,7 +66,8 @@ radix-server --name /my_kv_cache --data-bytes 1024G --mamba-ratio 0.2 \
 
 ### Client API
 
-A client connects to the local server by name and provides `query`, `pull_async`, `insert`, and `push_async`.
+A client connects to the local server by name and provides `query`, `pull_async`, `insert`, and the staged
+push `stage_push` / `submit_push` / `abort_push`.
 
 1. **Initialize.** Construct the client with the server name and a `Geometry` (tokens per block and bytes per
    slot), then wait until the server is ready.
@@ -113,13 +114,20 @@ for i, slot in enumerate(slots):
 client.insert(hashes, slots, start=matched)
 ```
 
-5. **Push.** `push_async()` is the reverse of `pull_async()`: it writes a prefix this node holds into a peer's
-   SlotStore (the server runs the RDMA WRITEs) and publishes it in the peer's index. With `rank=None` the RHT
-   picks the peer; with `evict_local=True` the local copy is dropped once the peer holds it. It needs
-   `--enable-remote-insert` and `--enable-remote-query` on the servers.
+5. **Push.** A staged push writes blocks a node computed into a peer's SlotStore and publishes them only in
+   the peer's index. `stage_push()` asks the peer for its hit and reserves slots for the blocks it lacks (one
+   `remote_prepare`), and borrows as many local slots, which this node never publishes. The caller writes block
+   `start + i` into `local_slots[i]` (for example a D2H copy), then `submit_push()` has the server WRITE them and
+   commit them on the peer; the borrowed slots return to the pool when the WRITE ends. `abort_push()` gives both
+   sides back. The target is `rank`, else the peer the RHT routes the deepest prefix to, else `fallback_rank`.
+   The target needs `--enable-remote-insert`; RHT target selection needs `--rht-slots` of 2 or more.
 
 ```python
-r = client.push_async(hashes).wait()   # [0, r.committed) is now on rank r.target_rank
+sp = client.stage_push(hashes, fallback_rank=p_rank)   # peer already holds hashes[:sp.start]
+for i, slot in enumerate(sp.local_slots):
+    dst = torch.frombuffer(client.slot_view(slot), dtype=torch.uint8)
+    dst.copy_(gpu_blocks[sp.start + i])
+r = client.submit_push(sp).wait()   # [0, r.committed) is now on rank r.target_rank
 ```
 
 `python tests/agentic_stress.py --nodes 4 --push --block-size 128 --turns 3,6` exercises it (data mode, more
