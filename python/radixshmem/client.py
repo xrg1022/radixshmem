@@ -95,7 +95,13 @@ class StagedPush:
     borrowed from this node's FULL pool and never published here. The caller
     writes block ``start + i`` into ``local_slots[i]``, then hands this to
     ``submit_push()`` or ``abort_push()`` exactly once. ``rank`` is -1 when no
-    target was found; ``end == start`` means there is nothing to write."""
+    target was found; ``end == start`` means there is nothing to write.
+
+    ``swa`` holds ``(offset, local, remote)`` per staged SWA run: write the SWA
+    state of block ``offset + i`` into ``local[i]``. ``mamba`` holds
+    ``(end, local, remote)`` per staged checkpoint: write the state at ``end``
+    into slot ``local``. Both cover only ``[0, end)`` and are empty when the
+    caller asked for none or either side's pool could not supply the lane."""
 
     rank: int
     hashes: np.ndarray
@@ -103,7 +109,20 @@ class StagedPush:
     end: int
     local_slots: np.ndarray
     remote_slots: np.ndarray
+    swa: List[Tuple[int, np.ndarray, np.ndarray]] = field(default_factory=list)
+    mamba: List[Tuple[int, int, int]] = field(default_factory=list)
     _used: bool = field(default=False, init=False, repr=False)
+
+    def _lanes(self) -> List[Tuple[ComponentType, np.ndarray, np.ndarray]]:
+        """(kind, local, remote) per staged lane, FULL first."""
+        lanes = [(FULL, self.local_slots, self.remote_slots)]
+        if self.swa:
+            lanes.append((SWA, np.concatenate([l for _, l, _ in self.swa]),
+                          np.concatenate([r for _, _, r in self.swa])))
+        if self.mamba:
+            lanes.append((MAMBA, np.asarray([l for _, l, _ in self.mamba], dtype=np.int32),
+                          np.asarray([r for _, _, r in self.mamba], dtype=np.int32)))
+        return lanes
 
 
 class PullJob:
@@ -162,16 +181,10 @@ class PushJob:
         self.job_id = job_id
         self._client = client
         self._f: concurrent.futures.Future = concurrent.futures.Future()
-        self._q = None                    # local source pin, held for the transfer
-        self._hashes: np.ndarray = np.empty(0, dtype=np.uint64)
-        self._rank = -1
-        self._start = 0                   # FULL prefix offset of the staged suffix
-        self._staged: Dict[ComponentType, np.ndarray] = {}   # target slots per lane
-        self._swa_fragments: List[Tuple[int, np.ndarray]] = []   # (offset, target slots)
-        self._checkpoints: List[Tuple[int, int]] = []            # (end_pos, target slot)
+        self._q = None                    # no local pin: the source is borrowed slots
         self._items: List[TransferItem] = []
         self._ticket = -1
-        self._sp: Optional[StagedPush] = None   # set by submit_push(): the source is borrowed slots
+        self._sp: Optional[StagedPush] = None
         self.remote_hit = 0
         self.planned_push = 0
 
@@ -410,29 +423,39 @@ class RadixClient:
 
     # ------------------------------------------------------------ staged push
 
-    def stage_push(self, hashes, *, rank: Optional[int] = None,
+    def stage_push(self, hashes, *, swa: Sequence[Tuple[int, int]] = (),
+                   mamba: Sequence[int] = (), rank: Optional[int] = None,
                    fallback_rank: Optional[int] = None) -> StagedPush:
         """Reserve on a peer the FULL blocks of ``hashes`` it lacks and borrow as
         many local slots to stage them in; nothing is published on this node.
-        The target is ``rank``, else the RHT's deepest holder, else
+        ``swa`` lists the ``[a, b)`` block runs and ``mamba`` the checkpoint
+        ends the caller can supply; the same prepare reserves those within the
+        staged ``[0, end)``, including runs below ``start`` (the peer may hold
+        that FULL prefix without the SWA window or checkpoint that ends the new
+        one). The target is ``rank``, else the RHT's deepest holder, else
         ``fallback_rank``. One remote_prepare both reads the peer's hit and
         reserves the rest, so the staged range cannot drift from the grant."""
         if self.local_read_only:
             raise RuntimeError("local_read_only client: stage_push needs the cluster plane")
         self.store
         h = np.ascontiguousarray(hashes, dtype=np.uint64)[:MAX_REMOTE_OP_BLOCKS]
-        if rank is None and len(h):
+        n = len(h)
+        # Clip to the truncated h; remote_prepare rejects any other bad entry.
+        runs = [(int(a), min(int(b), n)) for a, b in swa if int(a) < min(int(b), n)]
+        ends = [int(e) for e in mamba if int(e) <= n]
+        if rank is None and n:
             best = self._index.rht_probe(h)
             rank = int(best[0]) if best is not None else fallback_rank
-        if rank is None or len(h) == 0:
+        if rank is None or n == 0:
             return StagedPush(-1, h, 0, 0, _empty(), _empty())
         rank = int(rank)
         if rank == int(self._index.rank()):
             raise ValueError("push target is this node")
-        rep = self._index.remote_prepare(rank, h, len(h), [])
+        entries = [(SWA, b, b - a) for a, b in runs] + [(MAMBA, e, 1) for e in ends]
+        rep = self._index.remote_prepare(rank, h, n, entries)
         if int(rep.status) != 0:
             return StagedPush(rank, h, 0, 0, _empty(), _empty())
-        hr = min(int(rep.remote_hit), len(h))
+        hr = min(int(rep.remote_hit), n)
         remote = np.asarray(rep.full_slots, dtype=np.int32)
         want = min(len(remote), int(self._index.mempool_total()))
         local = self._index.allocate_slots(want, FULL) if want > 0 else _empty()
@@ -440,36 +463,79 @@ class RadixClient:
         if len(local) < len(remote):      # stage what fits; the peer keeps no surplus
             self.push_staging_shortfalls += 1
             self._index.remote_recycle(rank, remote[len(local):], component=FULL)
-            remote = remote[:len(local)]
-        return StagedPush(rank, h, hr, hr + len(local), local, remote)
+        sp = StagedPush(rank, h, hr, hr + len(local), local, remote[:len(local)])
+        self._stage_aux(sp, hr + len(remote), runs, ends, rep)
+        return sp
+
+    def _stage_aux(self, sp: StagedPush, grant: int, runs: List[Tuple[int, int]],
+                   ends: List[int], rep) -> None:
+        """Borrow local slots for the aux slots the peer granted inside
+        ``[0, sp.end)``; give the peer back the rest. The peer granted, in
+        request order, each SWA run's head below ``grant`` and each checkpoint
+        at or below it; a lane is all-or-none on either side."""
+        swa = np.asarray(rep.swa_slots, dtype=np.int32)
+        mam = np.asarray(rep.mamba_slots, dtype=np.int32)
+        pieces, pos = [], 0
+        for a, b in runs:
+            k = max(0, min(b, grant) - a)
+            pieces.append((a, swa[pos:pos + k]))
+            pos += k
+        cps = list(zip([e for e in ends if e <= grant], mam.tolist()))
+        if sp.end <= sp.start:            # no FULL suffix to write: push nothing
+            pieces, cps = [], []
+        pieces = [(a, r[:sp.end - a]) for a, r in pieces if a < sp.end and len(r)]
+        cps = [(e, r) for e, r in cps if e <= sp.end]
+        for kind, granted, kept in ((SWA, swa, np.concatenate([r for _, r in pieces])
+                                     if pieces else _empty()),
+                                    (MAMBA, mam, np.asarray([r for _, r in cps], dtype=np.int32))):
+            # Pools may differ per node: a grant above this pool must not raise here.
+            total = self._index.swa_mempool_total() if kind == SWA else self._index.mamba_mempool_total()
+            local = (self._index.allocate_slots(len(kept), kind)
+                     if 0 < len(kept) <= int(total) else _empty())
+            if len(local) != len(kept):
+                self.push_staging_shortfalls += 1
+                kept, local = _empty(), _empty()
+            extra = granted[~np.isin(granted, kept)]
+            if len(extra):
+                self._index.remote_recycle(sp.rank, extra, component=kind)
+            if not len(kept):
+                continue
+            if kind == SWA:
+                pos = 0
+                for a, r in pieces:
+                    sp.swa.append((a, local[pos:pos + len(r)], r))
+                    pos += len(r)
+            else:
+                sp.mamba = [(e, int(l), r) for (e, r), l in zip(cps, local.tolist())]
 
     def submit_push(self, sp: StagedPush, *, timeout_ms: int = 30000,
                     block: bool = True) -> PushJob:
         """WRITE the staged slots to the peer and publish them there. Call only
-        after every block is in ``sp.local_slots``. The borrowed slots return
-        to this node's pool when the WRITE ends, whatever its outcome."""
+        after every block is in place. The borrowed slots return to this
+        node's pool when the WRITE ends, whatever its outcome."""
         self._consume(sp)
         with self._mu:
             job = PushJob(self._next_id, self)
             self._next_id += 1
             self._jobs[job.job_id] = job
-        job._sp, job._hashes, job._rank = sp, sp.hashes, sp.rank
-        job._start = job.remote_hit = sp.start
+        job._sp = sp
+        job.remote_hit = sp.start
         job.planned_push = sp.end - sp.start
         if sp.end <= sp.start:
             job._f.set_result(PushResult(sp.start, 0, 0, sp.rank))
             return job
-        job._items = [(sp.rank, int(FULL), sp.remote_slots.tolist(), sp.local_slots.tolist(),
-                       OP_WRITE)]
+        job._items = [(sp.rank, int(kind), remote.tolist(), local.tolist(), OP_WRITE)
+                      for kind, local, remote in sp._lanes()]
         self._submit_job(job, timeout_ms, block, self._staged_push_complete)
         return job
 
     def abort_push(self, sp: StagedPush) -> None:
         """Give back both sides of a staged push that will not be submitted."""
         self._consume(sp)
-        if len(sp.remote_slots):
-            self._index.remote_recycle(sp.rank, sp.remote_slots, component=FULL)
-        self._recycle(sp.local_slots, FULL)
+        for kind, local, remote in sp._lanes():
+            if len(remote):
+                self._index.remote_recycle(sp.rank, remote, component=kind)
+            self._recycle(local, kind)
 
     def _consume(self, sp: StagedPush) -> None:
         # A second submit/abort would recycle the same slots twice.
@@ -480,16 +546,27 @@ class RadixClient:
 
     def _staged_push_complete(self, job: PushJob, replies: Sequence[TransferReply]) -> None:
         sp = job._sp
-        self._recycle(sp.local_slots, FULL)     # the WRITE has drained: the source is free
-        if not replies[0][0]:
-            self.push_transfer_failures += 1
-            self._index.remote_recycle(sp.rank, sp.remote_slots, component=FULL)
+        lanes = sp._lanes()
+        ok = {kind: bool(rep[0]) for (kind, _, _), rep in zip(lanes, replies)}
+        self.push_transfer_failures += sum(not v for v in ok.values())
+        entries, pushed, nbytes = [], 0, 0
+        for kind, local, remote in lanes:
+            self._recycle(local, kind)    # the WRITE has drained: the source is free
+            if not (ok[FULL] and ok[kind]):
+                self._index.remote_recycle(sp.rank, remote, component=kind)
+                continue
+            pushed += len(remote)
+            nbytes += len(remote) * int(self._store.pool(kind).slot_bytes)
+            if kind == FULL:
+                entries.append((FULL, sp.end, remote))
+            elif kind == SWA:
+                entries.extend((SWA, a + len(r), r) for a, _, r in sp.swa)
+            else:
+                entries.extend((MAMBA, e, np.asarray([r], dtype=np.int32)) for e, _, r in sp.mamba)
+        if not ok[FULL]:
             job._f.set_result(PushResult(sp.start, 0, 0, sp.rank))
             return
-        n = len(sp.local_slots)
-        nbytes = n * int(self._store.pool(FULL).slot_bytes)
-        res = self._index.remote_commit(sp.rank, sp.hashes[:sp.end],
-                                        [(FULL, sp.end, sp.remote_slots)])
+        res = self._index.remote_commit(sp.rank, sp.hashes[:sp.end], entries)
         # The peer recycled a failed insert itself; a lost reply may hide publication.
         # Either way the reserved slots are no longer ours to recycle.
         if int(res.status) != 0 or res.errors[0] != InsertError.OK or int(res.remote_hit) < sp.end:
@@ -497,7 +574,8 @@ class RadixClient:
             committed = 0
         else:
             committed = sp.end
-        job._f.set_result(PushResult(committed, n, nbytes, sp.rank))
+            self.push_commit_shortfalls += sum(e != InsertError.OK for e in res.errors[1:])
+        job._f.set_result(PushResult(committed, pushed, nbytes, sp.rank))
 
     def _submit_job(self, job: Union[PullJob, PushJob], timeout_ms: int,
                     block: bool, complete: Callable) -> None:
@@ -634,102 +712,6 @@ class RadixClient:
             job._f.set_result(res)
             if job._cancelled:      # cancelled between the pin above and here
                 res.finalize()
-
-    # Aux-lane push (SWA / Mamba) from a pinned local path (path_components). No caller
-    # until stage_push carries aux lanes; kept as the prepare/commit logic for them.
-
-    def _push_stage(self, job: PushJob, pa, full: int) -> int:
-        """Prepare target FULL and aux slots; return the granted FULL end."""
-        rank = job._rank
-        frags = [(int(off), np.asarray(s, dtype=np.int32)[:full - int(off)])
-                 for _, off, s in pa.swa_fragments if int(off) < full]
-        cps = [(int(e), int(s)) for e, s in pa.checkpoints if int(e) <= full]
-        entries = [(SWA, off + len(s), len(s)) for off, s in frags]
-        entries.extend((MAMBA, e, 1) for e, _ in cps)
-        rep = self._index.remote_prepare(rank, job._hashes, full, entries)
-        if int(rep.status) != 0:
-            return 0
-        job.remote_hit = hr = min(int(rep.remote_hit), len(job._hashes))
-        st = np.asarray(rep.full_slots, dtype=np.int32)
-        end = hr + len(st)
-        if end < full:
-            self.push_staging_shortfalls += 1
-        if end <= hr:
-            return hr
-        job._start = hr
-        job._staged[FULL] = st
-        job.planned_push = end - hr
-        job._items = [(rank, int(FULL), st.tolist(),
-                       np.asarray(pa.full_slots, dtype=np.int32)[hr:end].tolist(), OP_WRITE)]
-        # Send all aux state in [0, end), including the target's existing FULL prefix.
-        frags = [(off, s[:end - off]) for off, s in frags if off < end]
-        cps = [(e, s) for e, s in cps if e <= end]
-        lanes = []
-        if frags:
-            lanes.append((SWA, np.concatenate([s for _, s in frags]), rep.swa_slots))
-        if cps:
-            lanes.append((MAMBA, np.asarray([s for _, s in cps], dtype=np.int32), rep.mamba_slots))
-        for kind, local, slots in lanes:
-            st = np.asarray(slots, dtype=np.int32)
-            if len(st) != len(local):         # aux pools are all-or-none: short means skip the lane
-                self.push_staging_shortfalls += 1
-                if len(st):
-                    self._index.remote_recycle(rank, st, component=kind)
-                continue
-            job._staged[kind] = st
-            job._items.append((rank, int(kind), st.tolist(), local.tolist(), OP_WRITE))
-            if kind == SWA:
-                pos = 0
-                for off, s in frags:
-                    job._swa_fragments.append((off, st[pos:pos + len(s)]))
-                    pos += len(s)
-            else:
-                job._checkpoints = [(e, int(st[i])) for i, (e, _) in enumerate(cps)]
-        return end
-
-    def _push_complete(self, job: PushJob, replies: Sequence[TransferReply]) -> None:
-        ok = {ComponentType(k): bool(rep[0]) for (_, k, _, _, _), rep in zip(job._items, replies)}
-        self.push_transfer_failures += sum(not v for v in ok.values())
-        if job._q is not None:      # the transfer is terminal: sources may be evicted again
-            job._q.finalize()
-            job._q = None
-        rank, hr, st = job._rank, job._start, job._staged[FULL]
-        committed, pushed, nbytes = hr, 0, 0
-        # Count successful WRITEs once, independently of index publication.
-        for kind, success in ok.items():
-            if success:
-                count = len(job._staged[kind])
-                pushed += count
-                nbytes += count * int(self._store.pool(kind).slot_bytes)
-        end = hr + len(st)
-        entries = []
-        for kind in (FULL, SWA, MAMBA):
-            if kind not in job._staged:
-                continue
-            if not (ok[FULL] and ok[kind]):
-                self._index.remote_recycle(rank, job._staged[kind], component=kind)
-                continue
-            if kind == FULL:
-                entries.append((kind, end, st))
-            elif kind == SWA:
-                entries.extend((kind, off + len(s), s) for off, s in job._swa_fragments)
-            else:
-                entries.extend((kind, e, np.asarray([s], dtype=np.int32))
-                               for e, s in job._checkpoints)
-        if entries:
-            res = self._index.remote_commit(rank, job._hashes[:end], entries)
-            # A lost commit reply may hide publication: do not recycle its slots.
-            if int(res.status) != 0 or res.errors[0] != InsertError.OK or int(res.remote_hit) < end:
-                self.push_commit_shortfalls += 1
-                committed = 0
-            else:
-                committed = end
-                for error in res.errors[1:]:
-                    if error != InsertError.OK:
-                        self.push_commit_shortfalls += 1
-                        if error == InsertError.FULL_PATH_MISSING:
-                            committed = 0
-        job._f.set_result(PushResult(committed, pushed, nbytes, rank))
 
     def _recycle(self, slots, kind: ComponentType) -> None:
         if len(slots):

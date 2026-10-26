@@ -5,7 +5,8 @@
 transfer engine; a client configures node0, node1 takes the geometry from
 etcd, then a client on node1 pulls node0's blocks with concurrent
 pull_async() jobs, and stages pushes to node0 from borrowed slots that node1
-never publishes (stage_push / submit_push / abort_push).
+never publishes (stage_push / submit_push / abort_push), with the SWA window
+and Mamba checkpoint that end the pushed prefix.
 
     python3 test_p2p_pull.py [--index-dev mlx5_bond_0] [--transfer-dev mlx5_bond_0] [--gid-idx 3]
 
@@ -32,14 +33,18 @@ NAME = "/py_p2p"
 PREFIXES = 8
 PREFIX_LEN = 32
 SLOT_BYTES = 65536
+DATA_BYTES = 64 << 20
+SWA_RATIO, MAMBA_RATIO = 0.1, 0.05
+SWA_W = 20                      # > EXTRA: the pushed window starts below the peer's hit
 
 
 STAGED = (100, 101, 102, 103)   # extends the writer's prefix 0, fallback, aborted, no target
 EXTRA = 16                      # blocks each staged push adds
 
 
-def _pattern(k: int, i: int) -> bytes:
-    return (struct.pack("<i", k * 1000 + i * 7 + 3) * (SLOT_BYTES // 4))[:SLOT_BYTES]
+def _pattern(k: int, i: int, lane: int = 0) -> bytes:
+    """Bytes of block i of prefix k in lane 0 (FULL), 1 (SWA) or 2 (Mamba)."""
+    return (struct.pack("<i", lane * 10**6 + k * 1000 + i * 7 + 3) * (SLOT_BYTES // 4))[:SLOT_BYTES]
 
 
 def _staged_hashes(k: int):
@@ -56,6 +61,9 @@ def _staged_hashes(k: int):
 def client_main(role: str, endpoint: str) -> int:
     import numpy as np
     import radixshmem
+
+    AUX_MASK = (radixshmem.COMPONENT_MASK_FULL | radixshmem.COMPONENT_MASK_SWA
+                | radixshmem.COMPONENT_MASK_MAMBA)
 
     c = radixshmem.RadixClient(NAME, endpoint=endpoint)
     assert c.geometry["pools"]["full"]["slot_bytes"] == SLOT_BYTES
@@ -90,14 +98,21 @@ def client_main(role: str, endpoint: str) -> int:
         def push(sp, k):
             for i, s in enumerate(sp.local_slots):
                 c.slot_view(int(s))[:] = _pattern(k, sp.start + i)
+            for a, local, _ in sp.swa:
+                for i, s in enumerate(local):
+                    c.slot_view(int(s), radixshmem.ComponentType.SWA)[:] = _pattern(k, a + i, 1)
+            for e, s, _ in sp.mamba:
+                c.slot_view(s, radixshmem.ComponentType.MAMBA)[:] = _pattern(k, e, 2)
+            aux = [sum(len(l) for _, l, _ in sp.swa), len(sp.mamba)]
             r = c.submit_push(sp).wait(120)
-            return [sp.rank, sp.start, sp.end, r.committed, r.remote_blocks]
+            return [sp.rank, sp.start, sp.end, r.committed, r.remote_blocks, aux]
 
         ext, fresh, aborted, lost = (_staged_hashes(k) for k in STAGED)
-        out["rht"] = push(c.stage_push(ext), STAGED[0])
+        n = len(ext)
+        out["rht"] = push(c.stage_push(ext, swa=[(n - SWA_W, n)], mamba=[n]), STAGED[0])
         out["fallback"] = push(c.stage_push(fresh, fallback_rank=peer), STAGED[1])
-        sp = c.stage_push(aborted, rank=peer)
-        out["aborted"] = [sp.rank, sp.start, sp.end]
+        sp = c.stage_push(aborted, swa=[(0, EXTRA)], mamba=[EXTRA], rank=peer)
+        out["aborted"] = [sp.rank, sp.start, sp.end, len(sp.swa), len(sp.mamba)]
         c.abort_push(sp)
         sp = c.stage_push(lost)
         out["no_target"] = [sp.rank, sp.start, sp.end]
@@ -105,6 +120,8 @@ def client_main(role: str, endpoint: str) -> int:
         out["local_hits"] = [int(c.query(h, local_only=True, update_meta=False).common_hit)
                              for h in (ext, fresh, aborted)]
         out["borrowed_returned"] = int(c.mempool_used()) == used
+        out["aux_hits"] = [int(c.query(h, mask=AUX_MASK, local_only=True, update_meta=False).common_hit)
+                           for h in (ext, aborted)]
     elif role == "staged_check":
         out["hits"], out["bytes_ok"] = [], 0
         for k in STAGED[:3]:
@@ -114,6 +131,14 @@ def client_main(role: str, endpoint: str) -> int:
             first = PREFIX_LEN if k == STAGED[0] else 0
             out["bytes_ok"] += sum(bytes(c.slot_view(s)) == _pattern(k, i)
                                    for i, s in enumerate(slots) if i >= first)
+        ext = _staged_hashes(STAGED[0])
+        q = c.query(ext, mask=AUX_MASK, local_only=True, update_meta=False)
+        out["aux_hit"] = int(q.common_hit)
+        out["swa_ok"] = sum(bytes(c.slot_view(int(s), radixshmem.ComponentType.SWA))
+                            == _pattern(STAGED[0], int(q.swa_start) + i, 1)
+                            for i, s in enumerate(q.swa_slots))
+        out["mamba_ok"] = bool(q.mamba) and bytes(
+            c.slot_view(int(q.mamba[1]), radixshmem.ComponentType.MAMBA)) == _pattern(STAGED[0], len(ext), 2)
     elif role == "health":
         out["health"] = int(c.check_health())
         out["report"] = c.health_report().describe().strip()
@@ -215,14 +240,15 @@ def orchestrate(a) -> int:
         for i in range(2):
             logs.append(os.path.join(workdir, f"server{i}.log"))
             cmd = [sys.executable, "-m", "radixshmem.cli", "--name", NAME, "--node-name", f"node{i}",
-                   "--data-name", f"{NAME}_data{i}", "--data-bytes", "64M", "--no-prefault",
+                   "--data-name", f"{NAME}_data{i}", "--data-bytes", str(DATA_BYTES), "--no-prefault",
                    "--endpoint", endpoints[i], "--registry", registry, "--cluster-id", cluster_id,
                    "--expected-min-nodes", "2", "--rpc-address", "0.0.0.0", "--transfer-ip", "127.0.0.1",
                    "--gid-idx", str(a.gid_idx), "--bootstrap-timeout", str(a.bootstrap_timeout),
                    "--background-evict-ratio", "0", "--interval", "0",
                    # staged pushes: prepare/commit on the peer; 4 RHT slots keep node0's
                    # route to a prefix node1 has since pulled and republished
-                   "--enable-remote-insert", "--rht-slots", "4"]
+                   "--enable-remote-insert", "--rht-slots", "4",
+                   "--swa-ratio", str(SWA_RATIO), "--mamba-ratio", str(MAMBA_RATIO)]
             cmd += ["--index-dev", a.index_dev] if a.index_dev else []
             cmd += [f"--transfer-dev={d}" for d in a.transfer_dev]
             servers.append(subprocess.Popen(cmd, stdout=open(logs[i], "wb"), stderr=subprocess.STDOUT,
@@ -240,10 +266,13 @@ def orchestrate(a) -> int:
             check(cl.info.mode == "waiting" and cl.info.geometry is None, f"node{i} is waiting for a geometry")
 
         print("\n[2] a client brings node0 the geometry; node1 takes it from etcd; the cluster forms")
-        cl0 = radixshmem.RadixClient(NAME, radixshmem.Geometry(block_size=1, full_slot_bytes=SLOT_BYTES),
-                                   endpoint=endpoints[0])
+        geo = radixshmem.Geometry(block_size=1, full_slot_bytes=SLOT_BYTES, swa_slot_bytes=SLOT_BYTES,
+                                  swa_window_blocks=SWA_W, mamba_slot_bytes=SLOT_BYTES)
+        cl0 = radixshmem.RadixClient(NAME, geo, endpoint=endpoints[0])
         info = cl0.info
-        check(info.mode == "configuring" and info.geometry["pools"]["full"]["num_slots"] == (64 << 20) // SLOT_BYTES,
+        aux = int(SWA_RATIO * DATA_BYTES // SLOT_BYTES) + int(MAMBA_RATIO * DATA_BYTES // SLOT_BYTES)
+        check(info.mode == "configuring"
+              and info.geometry["pools"]["full"]["num_slots"] == DATA_BYTES // SLOT_BYTES - aux,
               f"the constructor returned at once with {info.geometry['pools']['full']['num_slots']} planned FULL slots")
         wait_log(logs, servers, "Cluster ready", a.bootstrap_timeout + 30)
         for i, cl in enumerate(probes):
@@ -255,7 +284,9 @@ def orchestrate(a) -> int:
         ranks = [int(read(l).split("rank=")[1].split("/")[0]) for l in logs]
         check(sorted(ranks) == [0, 1], f"etcd handed out ranks {ranks}")
         try:
-            radixshmem.RadixClient(NAME, radixshmem.Geometry(block_size=2, full_slot_bytes=SLOT_BYTES),
+            radixshmem.RadixClient(NAME, radixshmem.Geometry(block_size=2, full_slot_bytes=SLOT_BYTES,
+                                                         swa_slot_bytes=SLOT_BYTES, swa_window_blocks=SWA_W,
+                                                         mamba_slot_bytes=SLOT_BYTES),
                                  endpoint=endpoints[1])
         except radixshmem.GeometryMismatch as e:
             check("block_size" in str(e), f"node1 refuses another geometry ({e})")
@@ -286,18 +317,22 @@ def orchestrate(a) -> int:
         s, = run_clients([("stager", endpoints[1])])
         print(f"  {s}")
         n = PREFIX_LEN + EXTRA
-        check(s["rht"] == [ranks[0], PREFIX_LEN, n, n, EXTRA],
-              f"the RHT chose rank {ranks[0]}; only its {EXTRA} missing blocks were written and committed")
-        check(s["fallback"] == [ranks[0], 0, EXTRA, EXTRA, EXTRA],
+        check(s["rht"] == [ranks[0], PREFIX_LEN, n, n, EXTRA + SWA_W + 1, [SWA_W, 1]],
+              f"the RHT chose rank {ranks[0]}; its {EXTRA} missing FULL blocks, the whole SWA window "
+              "and the checkpoint were written and committed")
+        check(s["fallback"] == [ranks[0], 0, EXTRA, EXTRA, EXTRA, [0, 0]],
               "fallback_rank took a prefix the RHT does not route")
-        check(s["aborted"] == [ranks[0], 0, EXTRA], "an aborted push reserved its blocks first")
+        check(s["aborted"] == [ranks[0], 0, EXTRA, 1, 1], "an aborted push reserved its blocks and aux slots first")
         check(s["no_target"] == [-1, 0, 0], "no route and no fallback stages nothing")
         check(s["local_hits"] == [PREFIX_LEN, 0, 0], "node1 published none of the staged blocks")
         check(s["borrowed_returned"], "node1 got every borrowed slot back")
+        check(s["aux_hits"] == [0, 0], "node1 published no aux state")
         p, = run_clients([("staged_check", endpoints[0])])
         print(f"  {p}")
         check(p["hits"] == [n, EXTRA, 0], "node0 serves the pushed blocks and not the aborted ones")
         check(p["bytes_ok"] == 2 * EXTRA, "every pushed slot on node0 holds the staged bytes")
+        check(p["aux_hit"] == n and p["swa_ok"] == SWA_W and p["mamba_ok"],
+              "node0 hits the extended prefix with SWA and Mamba, and their slots hold the staged bytes")
 
         print("\n[6] both trees are leak-free")
         for i, h in enumerate(run_clients([("health", endpoints[0]), ("health", endpoints[1])])):

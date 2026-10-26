@@ -377,20 +377,28 @@ class Worker:
                                      lock=False, update_meta=False).common_hit)
 
     def staged_push(self, hashes: np.ndarray):
-        """stage_push, copy the blocks the peer lacks from the local copy into the
-        borrowed slots (the engine's D2H in a deployment), submit_push. None when
-        the local copy was evicted before it could be copied."""
-        c = self.client
-        sp = c.stage_push(hashes)
+        """stage_push with the turn's aux state (the SWA window or the checkpoint
+        ending it), copy what was staged from the local copy into the borrowed
+        slots (the engine's D2H in a deployment), submit_push. None when the
+        local copy lost a staged block before it could be copied."""
+        c, n, aux = self.client, len(hashes), self.cfg.aux
+        sp = c.stage_push(hashes, swa=[(max(0, n - self.cfg.swa_window), n)] if aux == "swa" else (),
+                          mamba=[n] if aux == "mamba" else ())
         if sp.end > sp.start:
-            q = c.query(hashes[:sp.end], mask=radixshmem.COMPONENT_MASK_FULL, local_only=True,
-                        lock=True, update_meta=False)
-            runs = [np.asarray(s, dtype=np.int64) for _, _, s in q.full_fragments]
-            src = np.concatenate(runs)[sp.start:sp.end] if runs else np.empty(0, np.int64)
-            whole = int(q.common_hit) >= sp.end and len(src) == sp.end - sp.start
+            pa = c.path_components(hashes[:sp.end], mask=self.mask, lock=True)
+            full = np.asarray(pa.full_slots, dtype=np.int64)
+            swa = {o + i: int(x) for _, o, sl in pa.swa_fragments for i, x in enumerate(sl)}
+            cps = {int(e): int(x) for e, x in pa.checkpoints}
+            whole = (int(pa.full_hit) >= sp.end
+                     and all(a + i in swa for a, l, _ in sp.swa for i in range(len(l)))
+                     and all(e in cps for e, _, _ in sp.mamba))
             if whole:
-                self.pools[FULL][sp.local_slots] = self.pools[FULL][src]
-            q.finalize()
+                self.pools[FULL][sp.local_slots] = self.pools[FULL][full[sp.start:sp.end]]
+                for a, l, _ in sp.swa:
+                    self.pools[SWA][l] = self.pools[SWA][[swa[a + i] for i in range(len(l))]]
+                for e, l, _ in sp.mamba:
+                    self.pools[MAMBA][l] = self.pools[MAMBA][cps[e]]
+            pa.finalize()
             if not whole:
                 c.abort_push(sp)
                 return None

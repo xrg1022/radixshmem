@@ -121,6 +121,8 @@ client.insert(hashes, slots, start=matched)
    commit them on the peer; the borrowed slots return to the pool when the WRITE ends. `abort_push()` gives both
    sides back. The target is `rank`, else the peer the RHT routes the deepest prefix to, else `fallback_rank`.
    The target needs `--enable-remote-insert`; RHT target selection needs `--rht-slots` of 2 or more.
+   With SWA or Mamba, pass the window (`swa=[(end - W, end)]`) or the checkpoint (`mamba=[end]`) that ends the
+   prefix; they are staged in `sp.swa` / `sp.mamba` and committed with the FULL blocks.
 
 ```python
 sp = client.stage_push(hashes, fallback_rank=p_rank)   # peer already holds hashes[:sp.start]
