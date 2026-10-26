@@ -455,11 +455,10 @@ class RadixClient:
         rep = self._index.remote_prepare(rank, h, n, entries)
         if int(rep.status) != 0:
             return StagedPush(rank, h, 0, 0, _empty(), _empty())
-        hr = min(int(rep.remote_hit), n)
+        hr = int(rep.remote_hit)
         remote = np.asarray(rep.full_slots, dtype=np.int32)
         want = min(len(remote), int(self._index.mempool_total()))
         local = self._index.allocate_slots(want, FULL) if want > 0 else _empty()
-        local = np.asarray(local, dtype=np.int32)
         if len(local) < len(remote):      # stage what fits; the peer keeps no surplus
             self.push_staging_shortfalls += 1
             self._index.remote_recycle(rank, remote[len(local):], component=FULL)
@@ -469,10 +468,11 @@ class RadixClient:
 
     def _stage_aux(self, sp: StagedPush, grant: int, runs: List[Tuple[int, int]],
                    ends: List[int], rep) -> None:
-        """Borrow local slots for the aux slots the peer granted inside
-        ``[0, sp.end)``; give the peer back the rest. The peer granted, in
-        request order, each SWA run's head below ``grant`` and each checkpoint
-        at or below it; a lane is all-or-none on either side."""
+        """Borrow local slots for the aux slots the peer granted; give the peer
+        back the rest. The peer granted, in request order, each SWA run's head
+        below ``grant`` and each checkpoint at or below it. A lane is
+        all-or-none on either side, and all are dropped when the FULL range
+        was cut below ``grant`` (they would not end at ``sp.end``)."""
         swa = np.asarray(rep.swa_slots, dtype=np.int32)
         mam = np.asarray(rep.mamba_slots, dtype=np.int32)
         pieces, pos = [], 0
@@ -481,10 +481,9 @@ class RadixClient:
             pieces.append((a, swa[pos:pos + k]))
             pos += k
         cps = list(zip([e for e in ends if e <= grant], mam.tolist()))
-        if sp.end <= sp.start:            # no FULL suffix to write: push nothing
+        pieces = [(a, r) for a, r in pieces if len(r)]
+        if sp.end < grant:
             pieces, cps = [], []
-        pieces = [(a, r[:sp.end - a]) for a, r in pieces if a < sp.end and len(r)]
-        cps = [(e, r) for e, r in cps if e <= sp.end]
         for kind, granted, kept in ((SWA, swa, np.concatenate([r for _, r in pieces])
                                      if pieces else _empty()),
                                     (MAMBA, mam, np.asarray([r for _, r in cps], dtype=np.int32))):
@@ -526,7 +525,7 @@ class RadixClient:
             return job
         job._items = [(sp.rank, int(kind), remote.tolist(), local.tolist(), OP_WRITE)
                       for kind, local, remote in sp._lanes()]
-        self._submit_job(job, timeout_ms, block, self._staged_push_complete)
+        self._submit_job(job, timeout_ms, block, self._push_complete)
         return job
 
     def abort_push(self, sp: StagedPush) -> None:
@@ -544,7 +543,7 @@ class RadixClient:
                 raise RuntimeError("staged push was already submitted or aborted")
             sp._used = True
 
-    def _staged_push_complete(self, job: PushJob, replies: Sequence[TransferReply]) -> None:
+    def _push_complete(self, job: PushJob, replies: Sequence[TransferReply]) -> None:
         sp = job._sp
         lanes = sp._lanes()
         ok = {kind: bool(rep[0]) for (kind, _, _), rep in zip(lanes, replies)}
@@ -579,7 +578,6 @@ class RadixClient:
 
     def _submit_job(self, job: Union[PullJob, PushJob], timeout_ms: int,
                     block: bool, complete: Callable) -> None:
-        job._complete = complete          # what the completer calls with the replies
         if block:
             self._slots.acquire()
         elif not self._slots.acquire(blocking=False):
@@ -619,8 +617,9 @@ class RadixClient:
                 if job is None:
                     continue
                 replies = rep["done"].get(ticket) or [(False, 0, 0, lost)] * len(job._items)
+                complete = self._push_complete if isinstance(job, PushJob) else self._pull_complete
                 try:
-                    job._complete(job, replies)
+                    complete(job, replies)
                 except Exception as e:  # noqa: BLE001
                     if job._q is not None:
                         job._q.finalize()

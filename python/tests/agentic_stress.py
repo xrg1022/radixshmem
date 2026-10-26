@@ -18,7 +18,8 @@ generate the new blocks' bytes -> think -> allocate, write, insert. Block
 bytes are a function of the block hash h: FULL [h, h+1, ...], SWA [~h, ~h+1,
 ...], Mamba [h, h-1, ...] as uint64 words, so a reader can check what it got.
 --index-only keeps the old index-only flow: query -> think -> insert.
---push stages each turn's FULL blocks in borrowed slots after the insert, fills
+--push stages each turn's blocks (with its SWA window or checkpoint) in borrowed
+slots after the insert, fills
 them from the local copy (standing in for the engine's D2H) and pushes them to
 the peer the RHT picks; --worker-hosts together with --remote-cmd starts ranks
 on other hosts.
